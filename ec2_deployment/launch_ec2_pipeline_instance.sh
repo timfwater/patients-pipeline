@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# -------- SETTINGS --------
+KEY_NAME="may_25_kp"
+KEY_PATH="$HOME/Desktop/patient-pipeline/may_25_kp.pem"
+INSTANCE_TYPE="t2.micro"
+AMI_ID="ami-0c02fb55956c7d316"  # Amazon Linux 2 in us-east-1
+SECURITY_GROUP_ID="sg-09be1dde75a78c79a"
+IAM_INSTANCE_PROFILE_NAME="LLM_EC2_InstanceProfile"
+INSTANCE_NAME="patient-pipeline-instance"
+PROJECT_DIR="$HOME/Desktop/patient-pipeline/ec2_deployment"
+DOCKER_IMAGE_NAME="patient-pipeline"
+ENV_FILE="env.list"
+
+# -------- GET YOUR PUBLIC IP --------
+USER_IP=$(curl -s -4 ifconfig.me)
+echo "Your public IP is: $USER_IP"
+
+# -------- LAUNCH EC2 INSTANCE --------
+echo "Launching EC2 instance..."
+INSTANCE_ID=$(aws ec2 run-instances \
+  --image-id $AMI_ID \
+  --count 1 \
+  --instance-type $INSTANCE_TYPE \
+  --key-name $KEY_NAME \
+  --security-group-ids $SECURITY_GROUP_ID \
+  --iam-instance-profile Name=$IAM_INSTANCE_PROFILE_NAME \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME}]" \
+  --query 'Instances[0].InstanceId' \
+  --output text)
+
+echo "Instance launched: $INSTANCE_ID"
+echo "Waiting for instance to be running..."
+aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+
+PUBLIC_IP=$(aws ec2 describe-instances \
+  --instance-ids $INSTANCE_ID \
+  --query "Reservations[0].Instances[0].PublicIpAddress" \
+  --output text)
+
+echo "Instance is ready!"
+echo "Public IP: $PUBLIC_IP"
+
+# -------- UPLOAD PROJECT FILES --------
+echo "Uploading code to EC2..."
+scp -i $KEY_PATH -o StrictHostKeyChecking=no -r "$PROJECT_DIR" ec2-user@$PUBLIC_IP:/home/ec2-user/
+scp -i $KEY_PATH -o StrictHostKeyChecking=no "$PROJECT_DIR/$ENV_FILE" ec2-user@$PUBLIC_IP:/home/ec2-user/
+
+# -------- SSH AND RUN DOCKER --------
+echo "Connecting and running Docker container..."
+ssh -i $KEY_PATH -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP <<EOF
+  sudo yum update -y
+  sudo yum install docker -y
+  sudo systemctl start docker
+  cd /home/ec2-user/$(basename "$PROJECT_DIR")
+  sudo docker build -t $DOCKER_IMAGE_NAME .
+  sudo docker run --env-file /home/ec2-user/$ENV_FILE $DOCKER_IMAGE_NAME
+EOF
+
+echo "✅ Done. Check your email and S3 output bucket."

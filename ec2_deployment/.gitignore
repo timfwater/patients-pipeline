@@ -1,0 +1,7 @@
+.env
+env.list
+*.pem
+__pycache__/
+*.pyc
+*.zip
+
