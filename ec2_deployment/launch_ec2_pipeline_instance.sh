@@ -46,6 +46,17 @@ echo "Uploading code to EC2..."
 scp -i $KEY_PATH -o StrictHostKeyChecking=no -r "$PROJECT_DIR" ec2-user@$PUBLIC_IP:/home/ec2-user/
 scp -i $KEY_PATH -o StrictHostKeyChecking=no "$PROJECT_DIR/$ENV_FILE" ec2-user@$PUBLIC_IP:/home/ec2-user/
 
+
+# -------- PROMPT FOR OVERRIDES (Optional inputs) --------
+read -p "Enter THRESHOLD override (default 0.8): " THRESHOLD_OVERRIDE
+read -p "Enter START_DATE override (YYYY-MM-DD, default 2024-05-01): " START_DATE_OVERRIDE
+read -p "Enter END_DATE override (YYYY-MM-DD, default 2024-05-01): " END_DATE_OVERRIDE
+
+# Apply defaults if user input is empty
+THRESHOLD_OVERRIDE=${THRESHOLD_OVERRIDE:-0.8}
+START_DATE_OVERRIDE=${START_DATE_OVERRIDE:-2024-05-01}
+END_DATE_OVERRIDE=${END_DATE_OVERRIDE:-2024-05-01}
+
 # -------- SSH AND RUN DOCKER --------
 echo "Connecting and running Docker container..."
 ssh -i $KEY_PATH -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP <<EOF
@@ -54,7 +65,12 @@ ssh -i $KEY_PATH -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP <<EOF
   sudo systemctl start docker
   cd /home/ec2-user/$(basename "$PROJECT_DIR")
   sudo docker build -t $DOCKER_IMAGE_NAME .
-  sudo docker run --env-file /home/ec2-user/$ENV_FILE $DOCKER_IMAGE_NAME
+	sudo docker run \
+  	--env-file /home/ec2-user/$ENV_FILE \
+  	--env THRESHOLD=$THRESHOLD_OVERRIDE \
+  	--env START_DATE=$START_DATE_OVERRIDE \
+  	--env END_DATE=$END_DATE_OVERRIDE \
+  	$DOCKER_IMAGE_NAME
 EOF
 
 echo "✅ Done. Check your email and S3 output bucket."
