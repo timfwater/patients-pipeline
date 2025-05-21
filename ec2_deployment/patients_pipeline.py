@@ -23,7 +23,6 @@ RISK_PROMPT = (
     "Here is the patient summary:\n\n"
 )
 
-
 COMBINED_PROMPT = """
 You are a primary care physician reviewing the following patient note:
 
@@ -51,14 +50,12 @@ Top Medical Concerns:
 def extract_risk_score(text):
     if not isinstance(text, str):
         return None
-
     match = re.search(r'Risk Score:\s*(\d{1,3})', text)
     if match:
         score = int(match.group(1))
         if 0 <= score <= 100:
             return score / 100.0
     return None
-
 
 def get_chat_response(inquiry_note, model="gpt-3.5-turbo"):
     client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -96,8 +93,8 @@ def main():
     email_to = os.environ["EMAIL_TO"]
     email_from = os.environ["EMAIL_FROM"]
     threshold = float(os.environ.get("THRESHOLD", 0.8))
-    start_date = os.environ.get("START_DATE", "2024-05-01")
-    end_date = os.environ.get("END_DATE", "2024-05-01")
+    start_date = pd.to_datetime(os.environ.get("START_DATE", "2024-05-01"))
+    end_date = pd.to_datetime(os.environ.get("END_DATE", "2024-05-01"))
 
     input_bucket, input_key = input_s3.replace("s3://", "").split("/", 1)
     output_bucket, output_key = output_s3.replace("s3://", "").split("/", 1)
@@ -112,52 +109,51 @@ def main():
     logger.info("Loading input CSV...")
     df = pd.read_csv(local_input)
     df_original = df.copy()
-    
+
     logger.info("Running risk assessments...")
     df['risk_rating'] = df['full_note'].apply(lambda note: get_chat_response(RISK_PROMPT + note)['message']['content'])
     df['risk_score'] = df['risk_rating'].apply(extract_risk_score)
 
+    if df['risk_score'].dropna().empty:
+        logger.warning("No valid risk scores found. Exiting.")
+        return
+
     logger.info("Generating care recommendations where risk > threshold...")
-    high_risk_mask = df['risk_score'] > threshold
-    df.loc[high_risk_mask, 'combined_response'] = df.loc[high_risk_mask, 'full_note'].apply(query_combined_prompt)
+    high_risk_df = df.nlargest(int((1 - threshold) * len(df)), 'risk_score')
+    df.loc[high_risk_df.index, 'combined_response'] = high_risk_df['full_note'].apply(query_combined_prompt)
 
     parsed = df['combined_response'].dropna().apply(parse_response_and_concerns)
     df[parsed.columns] = parsed
 
     logger.info("Merging model output onto original input DataFrame...")
-    
     columns_to_keep = [
         "idx", "visit_date", "risk_rating", "risk_score", "combined_response",
         "follow_up_1mo", "follow_up_6mo", "oncology_rec", "cardiology_rec", "top_concerns"
     ]
-
-    # 👇 Keep only the columns being merged on and the new columns
     columns_to_merge = [col for col in columns_to_keep if col not in df_original.columns or col in ["idx", "visit_date"]]
 
-    
     df_final = df_original.merge(
         df[columns_to_merge],
         on=["idx", "visit_date"],
         how="left"
     )
-    
+
     logger.info("Saving merged output to local file...")
     df_final.to_csv(local_output, index=False)
-    
+
     logger.info("Uploading merged output to S3...")
     s3.upload_file(local_output, output_bucket, output_key)
-
 
     logger.info("Filtering by date range and preparing email summary...")
     df['visit_date'] = pd.to_datetime(df['visit_date'], errors='coerce')
     mask_time = (df['visit_date'] >= start_date) & (df['visit_date'] <= end_date)
 
     df_email = df[
-    mask_time &
-    df['risk_score'].notna() &
-    (df['risk_score'] > threshold)
+        mask_time &
+        df['risk_score'].notna() &
+        (df['risk_score'] > threshold)
     ]
-    
+
     if df_email.empty:
         logger.info("No high-risk patients in selected date range.")
         return
@@ -168,14 +164,13 @@ def main():
         concerns_lines = str(concerns_raw or '').strip().split('\n')
         concerns_formatted = '\n'.join(f"    {line.strip()}" for line in concerns_lines if line.strip())
 
-        note = f"""📋 Patient ID: {row.get('patient_id', f'#{idx+1}')}
+        note = f"""📋 Patient ID: {row['idx'] if pd.notna(row['idx']) else 'N/A'}
     Visit Date: {row.get('visit_date', 'N/A')}
     Risk Score: {row.get('risk_score', 'N/A')}
     Follow-up 1 Month: {row.get('follow_up_1mo', 'N/A')}
     Follow-up 6 Months: {row.get('follow_up_6mo', 'N/A')}
     Oncology Recommended: {row.get('oncology_rec', 'N/A')}
     Cardiology Recommended: {row.get('cardiology_rec', 'N/A')}
-
     Top Medical Concerns:
 {concerns_formatted}
     ----------------------------------------"""
@@ -185,7 +180,7 @@ def main():
 Hello Team,
 
 Please review the following high-risk patient notes and follow-up recommendations
-from {start_date} to {end_date}:
+from {start_date.date()} to {end_date.date()}:
 
 {chr(10).join(sections)}
 
