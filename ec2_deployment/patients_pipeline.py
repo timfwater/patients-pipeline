@@ -1,10 +1,20 @@
 import pandas as pd
+from io import StringIO
 import re
 import logging
 import os
 import boto3
 import openai
 from datetime import datetime
+import ast  # Safe parsing for list-like strings
+import warnings
+from time import time
+from dotenv import load_dotenv
+
+# --- Load environment variables from .env file ---
+load_dotenv()
+
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -57,26 +67,37 @@ def extract_risk_score(text):
             return score / 100.0
     return None
 
-def get_chat_response(inquiry_note, model="gpt-3.5-turbo"):
-    client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": inquiry_note}]
-    )
-    return {"message": {"content": response.choices[0].message.content}}
+def get_chat_response(inquiry_note, model="gpt-3.5-turbo", retries=3, delay=5):
+    openai.api_key = os.environ["OPENAI_API_KEY"]
+    for attempt in range(retries):
+        try:
+            response = openai.ChatCompletion.create(
+                model=model,
+                messages=[{"role": "user", "content": inquiry_note}]
+            )
+            return {"message": {"content": response.choices[0].message.content}}
+        except Exception as e:
+            logger.warning(f"Attempt {attempt+1} failed: {e}")
+            time.sleep(delay)
+    logger.error("All retries failed for OpenAI API.")
+    return {"message": {"content": ""}}
+
 
 def query_combined_prompt(note, template=COMBINED_PROMPT):
     prompt = template.format(note=note)
     response = get_chat_response(prompt)['message']['content']
     return response
 
+def safe_split(line):
+    return line.split(':', 1)[1].strip() if ':' in line else None
+
 def parse_response_and_concerns(text):
     try:
         parts = text.strip().split('\n')
-        f1mo = parts[0].split(':')[1].strip()
-        f6mo = parts[1].split(':')[1].strip()
-        onc = parts[2].split(':')[1].strip()
-        card = parts[3].split(':')[1].strip()
+        f1mo = safe_split(parts[0])
+        f6mo = safe_split(parts[1])
+        onc = safe_split(parts[2])
+        card = safe_split(parts[3])
         concerns_start = next(i for i, line in enumerate(parts) if "Top Medical Concerns" in line)
         concerns_lines = parts[concerns_start+1:]
         concerns_text = '\n'.join(concerns_lines).strip()
@@ -88,13 +109,15 @@ def parse_response_and_concerns(text):
 
 # --- Main ---
 def main():
+    start_time = time()
     input_s3 = os.environ["INPUT_S3"]
     output_s3 = os.environ["OUTPUT_S3"]
     email_to = os.environ["EMAIL_TO"]
     email_from = os.environ["EMAIL_FROM"]
-    threshold = float(os.environ.get("THRESHOLD", 0.8))
+    threshold = float(os.environ.get("THRESHOLD", 0.95))
     start_date = pd.to_datetime(os.environ.get("START_DATE", "2024-05-01"))
-    end_date = pd.to_datetime(os.environ.get("END_DATE", "2024-05-01"))
+    end_date = pd.to_datetime(os.environ.get("END_DATE", "2024-05-07"))
+    physician_ids_raw = os.environ.get("PHYSICIAN_ID_LIST", "").strip()
 
     input_bucket, input_key = input_s3.replace("s3://", "").split("/", 1)
     output_bucket, output_key = output_s3.replace("s3://", "").split("/", 1)
@@ -104,55 +127,106 @@ def main():
 
     s3 = boto3.client('s3')
     logger.info("Downloading input file from S3...")
+    
     s3.download_file(input_bucket, input_key, local_input)
 
     logger.info("Loading input CSV...")
     df = pd.read_csv(local_input)
+
+    logger.info(f"Input rows loaded: {len(df)}")
+    
+    # ✅ Check for required columns
+    required_cols = ["idx", "visit_date", "full_note", "physician_id"]
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        logger.error(f"Missing required columns in input file: {missing}")
+        return
+    
     df_original = df.copy()
+    
+    # Convert visit_date to datetime early
+    df['visit_date'] = pd.to_datetime(df['visit_date'], errors='coerce')
+
+    # --- Filtering by physician_id and visit_date BEFORE any OpenAI call ---
+    physician_id_filter = None
+    if physician_ids_raw:
+        try:
+            parsed_ids = ast.literal_eval(physician_ids_raw)
+            if isinstance(parsed_ids, int):
+                physician_id_filter = [parsed_ids]
+            elif isinstance(parsed_ids, list):
+                physician_id_filter = parsed_ids
+            else:
+                logger.warning("Physician ID list must be int or list of ints.")
+        except Exception as e:
+            logger.error(f"Failed to parse PHYSICIAN_ID_LIST: {e}")
+
+    mask = (df['visit_date'] >= start_date) & (df['visit_date'] <= end_date)
+
+    if physician_id_filter:
+        logger.info(f"Filtering for physician_id in: {physician_id_filter}")
+        mask &= df['physician_id'].isin(physician_id_filter)
+
+    df_filtered = df[mask].copy()
+
+    if df_filtered.empty:
+        logger.warning("No records matched physician/date filters. Exiting.")
+        return
 
     logger.info("Running risk assessments...")
-    df['risk_rating'] = df['full_note'].apply(lambda note: get_chat_response(RISK_PROMPT + note)['message']['content'])
-    df['risk_score'] = df['risk_rating'].apply(extract_risk_score)
+    df_filtered['risk_rating'] = df_filtered['full_note'].apply(lambda note: get_chat_response(RISK_PROMPT + note)['message']['content'])
+    df_filtered['risk_score'] = df_filtered['risk_rating'].apply(extract_risk_score)
 
-    if df['risk_score'].dropna().empty:
+    if not df_filtered['risk_score'].dropna().empty:
+        logger.info(f"Risk score stats:\n{df_filtered['risk_score'].describe()}")
+
+    
+    if df_filtered['risk_score'].dropna().empty:
         logger.warning("No valid risk scores found. Exiting.")
         return
 
     logger.info("Generating care recommendations where risk > threshold...")
-    high_risk_df = df.nlargest(int((1 - threshold) * len(df)), 'risk_score')
-    df.loc[high_risk_df.index, 'combined_response'] = high_risk_df['full_note'].apply(query_combined_prompt)
+    high_risk_df = df_filtered.nlargest(int((1 - threshold) * len(df_filtered)), 'risk_score')
+    df_filtered.loc[high_risk_df.index, 'combined_response'] = high_risk_df['full_note'].apply(query_combined_prompt)
 
-    parsed = df['combined_response'].dropna().apply(parse_response_and_concerns)
-    df[parsed.columns] = parsed
+    logger.info(f"Rows after date/physician filtering: {len(df_filtered)}")
+
+    # Continue with merging and email steps as before...
+
+    parsed = df_filtered['combined_response'].dropna().apply(parse_response_and_concerns)
+    df_filtered[parsed.columns] = parsed
+
 
     logger.info("Merging model output onto original input DataFrame...")
     columns_to_keep = [
         "idx", "visit_date", "risk_rating", "risk_score", "combined_response",
         "follow_up_1mo", "follow_up_6mo", "oncology_rec", "cardiology_rec", "top_concerns"
     ]
-    columns_to_merge = [col for col in columns_to_keep if col not in df_original.columns or col in ["idx", "visit_date"]]
+    columns_to_merge = [col for col in columns_to_keep if col in df_filtered.columns]
 
     df_final = df_original.merge(
-        df[columns_to_merge],
+        df_filtered[columns_to_merge],
         on=["idx", "visit_date"],
         how="left"
     )
 
     logger.info("Saving merged output to local file...")
-    df_final.to_csv(local_output, index=False)
 
-    logger.info("Uploading merged output to S3...")
-    s3.upload_file(local_output, output_bucket, output_key)
+    csv_buffer = StringIO()
+    df_final.to_csv(csv_buffer, index=False)
+    s3.put_object(Bucket=output_bucket, Key=output_key, Body=csv_buffer.getvalue())
 
     logger.info("Filtering by date range and preparing email summary...")
-    df['visit_date'] = pd.to_datetime(df['visit_date'], errors='coerce')
-    mask_time = (df['visit_date'] >= start_date) & (df['visit_date'] <= end_date)
+    
+    mask_time = (df_filtered['visit_date'] >= start_date) & (df_filtered['visit_date'] <= end_date)
 
-    df_email = df[
+    df_email = df_filtered[
         mask_time &
-        df['risk_score'].notna() &
-        (df['risk_score'] > threshold)
+        df_filtered['risk_score'].notna() &
+        (df_filtered['risk_score'] > threshold)
     ]
+
+    logger.info(f"Rows with high risk score: {len(df_email)}")
 
     if df_email.empty:
         logger.info("No high-risk patients in selected date range.")
@@ -202,6 +276,8 @@ Your Clinical Risk Bot
         logger.info("✅ Email sent! Message ID: %s", response["MessageId"])
     except Exception as e:
         logger.error("❌ Failed to send email: %s", e)
+        
+    logger.info("⏱️ Script completed in %.2f seconds", time() - start_time)
 
 if __name__ == "__main__":
     main()
