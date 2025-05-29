@@ -1,3 +1,0 @@
-cd ~/Desktop/LLM
-chmod +x launch_ec2_pipeline_instance.sh
-./launch_ec2_pipeline_instance.sh

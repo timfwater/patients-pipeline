@@ -10,6 +10,8 @@ import ast
 import warnings
 import time
 from dotenv import load_dotenv
+import json
+from datetime import datetime
 
 # --- Load environment variables from .env file ---
 load_dotenv()
@@ -106,9 +108,18 @@ def parse_response_and_concerns(text):
         logger.warning(f"Failed to parse response: {e}")
         return pd.Series([None]*5, index=['follow_up_1mo', 'follow_up_6mo', 'oncology_rec', 'cardiology_rec', 'top_concerns'])
 
+def log_audit_summary(s3_client, bucket, key, summary):
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(summary, indent=2).encode("utf-8")
+    )
+    
 # --- Main ---
 def main():
     start_time = time.time()
+    logger.info("📌 Starting main() and reading env vars...")
+
     input_s3 = os.environ["INPUT_S3"]
     output_s3 = os.environ["OUTPUT_S3"]
     email_to = os.environ["EMAIL_TO"]
@@ -124,9 +135,15 @@ def main():
     local_input = '/tmp/input.csv'
     local_output = '/tmp/output.csv'
 
-    s3 = boto3.client('s3')
-    logger.info("Downloading input file from S3...")
-    s3.download_file(input_bucket, input_key, local_input)
+    s3 = boto3.client('s3', region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    logger.info(f"🪣 About to download from S3: bucket={input_bucket}, key={input_key}")
+    logger.info(f"📥 Attempting to download from s3://{input_bucket}/{input_key}")
+    try:
+        s3.download_file(input_bucket, input_key, local_input)
+        logger.info("✅ Download succeeded.")
+    except Exception as e:
+        logger.error(f"❌ S3 download failed: {e}")
+        raise
 
     logger.info("Loading input CSV...")
     df = pd.read_csv(local_input)
@@ -144,10 +161,13 @@ def main():
     physician_id_filter = None
     if physician_ids_raw:
         try:
-            parsed_ids = ast.literal_eval(physician_ids_raw)
-            physician_id_filter = [parsed_ids] if isinstance(parsed_ids, int) else parsed_ids
+            physician_id_filter = [int(x.strip()) for x in physician_ids_raw.split(",") if x.strip().isdigit()]
+            if not physician_id_filter:
+                logger.warning("PHYSICIAN_ID_LIST provided but no valid IDs were parsed.")
+                physician_id_filter = None
         except Exception as e:
             logger.error(f"Failed to parse PHYSICIAN_ID_LIST: {e}")
+            physician_id_filter = None
 
     mask = (df['visit_date'] >= start_date) & (df['visit_date'] <= end_date)
     if physician_id_filter:
@@ -241,6 +261,31 @@ Your Clinical Risk Bot
         logger.info("✅ Email sent! Message ID: %s", response["MessageId"])
     except Exception as e:
         logger.error("❌ Failed to send email: %s", e)
+
+    # Summarize run
+
+    summary = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "physician_id": os.getenv("PHYSICIAN_ID_LIST"),
+        "date_start": os.getenv("DATE_START"),
+        "date_end": os.getenv("DATE_END"),
+        "total_notes": len(df),
+        "high_risk_count": df['risk_score'].notna().sum(),
+        "email_sent": high_risk_df is not None and not high_risk_df.empty,
+        "output_path": f"s3://{output_bucket}/{output_key}",
+        "run_duration_sec": round(time.time() - start_time, 2),
+        "ecs_task_id": os.getenv("TASK_ID")
+    }
+
+
+    # Define S3 audit path
+    audit_bucket = "medical-note-llm"
+    audit_key = f"audit_logs/{datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%SZ')}_summary.json"
+
+    log_audit_summary(s3, audit_bucket, audit_key, summary)
+
+    logger.info(f"✅ Audit log written to s3://{audit_bucket}/{audit_key}")
+
 
     logger.info("⏱️ Script completed in %.2f seconds", time.time() - start_time)
 

@@ -40,22 +40,25 @@ PUBLIC_IP=$(aws ec2 describe-instances \
 
 echo "Instance is ready!"
 echo "Public IP: $PUBLIC_IP"
+echo "Waiting for instance to finish booting..."
+sleep 20
 
 # -------- UPLOAD PROJECT FILES --------
 echo "Uploading code to EC2..."
 scp -i $KEY_PATH -o StrictHostKeyChecking=no -r "$PROJECT_DIR" ec2-user@$PUBLIC_IP:/home/ec2-user/
 scp -i $KEY_PATH -o StrictHostKeyChecking=no "$PROJECT_DIR/$ENV_FILE" ec2-user@$PUBLIC_IP:/home/ec2-user/
 
-
-# -------- PROMPT FOR OVERRIDES (Optional inputs) --------
+# -------- PROMPT FOR OVERRIDES --------
 read -p "Enter THRESHOLD override (default 0.8): " THRESHOLD_OVERRIDE
 read -p "Enter START_DATE override (YYYY-MM-DD, default 2024-05-01): " START_DATE_OVERRIDE
 read -p "Enter END_DATE override (YYYY-MM-DD, default 2024-05-01): " END_DATE_OVERRIDE
+read -p "Enter PHYSICIAN_ID_LIST (e.g. 101 or 101,102,103 — leave blank for all): " PHYSICIAN_ID_OVERRIDE
 
 # Apply defaults if user input is empty
 THRESHOLD_OVERRIDE=${THRESHOLD_OVERRIDE:-0.8}
 START_DATE_OVERRIDE=${START_DATE_OVERRIDE:-2024-05-01}
 END_DATE_OVERRIDE=${END_DATE_OVERRIDE:-2024-05-01}
+PHYSICIAN_ID_OVERRIDE=${PHYSICIAN_ID_OVERRIDE:-""}
 
 # -------- SSH AND RUN DOCKER --------
 echo "Connecting and running Docker container..."
@@ -70,6 +73,7 @@ ssh -i $KEY_PATH -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP <<EOF
   	--env THRESHOLD=$THRESHOLD_OVERRIDE \
   	--env START_DATE=$START_DATE_OVERRIDE \
   	--env END_DATE=$END_DATE_OVERRIDE \
+  	--env PHYSICIAN_ID_LIST="$PHYSICIAN_ID_OVERRIDE" \
   	$DOCKER_IMAGE_NAME
 EOF
 
