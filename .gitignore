@@ -1,1 +1,21 @@
+# 🔐 Sensitive files
 *.pem
+.env
+.env.*
+env.list
+*.env.list
+
+# 📦 Python cache
+__pycache__/
+*.py[cod]
+
+# 🧪 Jupyter/Notebook cache (if ever used)
+.ipynb_checkpoints/
+
+# 🧼 macOS system clutter
+.DS_Store
+
+# 🚫 Local editor settings (optional)
+.vscode/
+.idea/
+
