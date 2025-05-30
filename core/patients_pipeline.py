@@ -11,7 +11,6 @@ import warnings
 import time
 from dotenv import load_dotenv
 import json
-from datetime import datetime
 
 # --- Load environment variables from .env file ---
 load_dotenv()
@@ -114,7 +113,7 @@ def log_audit_summary(s3_client, bucket, key, summary):
         Key=key,
         Body=json.dumps(summary, indent=2).encode("utf-8")
     )
-    
+
 # --- Main ---
 def main():
     start_time = time.time()
@@ -137,7 +136,6 @@ def main():
 
     s3 = boto3.client('s3', region_name=os.environ.get("AWS_REGION", "us-east-1"))
     logger.info(f"🪣 About to download from S3: bucket={input_bucket}, key={input_key}")
-    logger.info(f"📥 Attempting to download from s3://{input_bucket}/{input_key}")
     try:
         s3.download_file(input_bucket, input_key, local_input)
         logger.info("✅ Download succeeded.")
@@ -211,7 +209,6 @@ def main():
     s3.put_object(Bucket=output_bucket, Key=output_key, Body=csv_buffer.getvalue())
     logger.info("✅ Output written to S3")
 
-    # ✅ Use the same high-risk rows from above for the email
     df_email = high_risk_df.copy()
     logger.info(f"Rows with high risk score: {len(df_email)}")
 
@@ -262,8 +259,6 @@ Your Clinical Risk Bot
     except Exception as e:
         logger.error("❌ Failed to send email: %s", e)
 
-    # Summarize run
-
     summary = {
         "timestamp": datetime.utcnow().isoformat(),
         "physician_id": os.getenv("PHYSICIAN_ID_LIST"),
@@ -277,16 +272,10 @@ Your Clinical Risk Bot
         "ecs_task_id": os.getenv("TASK_ID")
     }
 
-
-    # Define S3 audit path
     audit_bucket = "medical-note-llm"
     audit_key = f"audit_logs/{datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%SZ')}_summary.json"
-
     log_audit_summary(s3, audit_bucket, audit_key, summary)
-
     logger.info(f"✅ Audit log written to s3://{audit_bucket}/{audit_key}")
-
-
     logger.info("⏱️ Script completed in %.2f seconds", time.time() - start_time)
 
 if __name__ == "__main__":
