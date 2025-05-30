@@ -1,0 +1,44 @@
+{
+  "family": "patient-pipeline-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::665277163763:role/PatientPipelineECSExecutionRole",
+  "taskRoleArn": "arn:aws:iam::665277163763:role/PatientPipelineECSExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "patient-pipeline",
+      "image": "665277163763.dkr.ecr.us-east-1.amazonaws.com/patient-pipeline:latest",
+      "essential": true,
+      "secrets": [
+        {
+          "name": "OPENAI_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:665277163763:secret:openai/api-key"
+        }
+      ],
+      "environment": [
+        { "name": "INPUT_FILE", "value": "may_01_14.csv" },
+        { "name": "PHYSICIAN_ID", "value": "1" },
+        { "name": "INPUT_S3", "value": "s3://medical-note-llm/Input/may_01_14.csv" },
+        { "name": "OUTPUT_S3", "value": "s3://medical-note-llm/Output/output_fargate.csv" },
+        { "name": "EMAIL_TO", "value": "timfwater@gmail.com" },
+        { "name": "EMAIL_FROM", "value": "timfwater@gmail.com" },
+        { "name": "THRESHOLD", "value": "0.94" },
+        { "name": "START_DATE", "value": "2024-05-01" },
+        { "name": "END_DATE", "value": "2024-05-07" },
+        { "name": "PHYSICIAN_ID_LIST", "value": "1" },
+        { "name": "AWS_REGION", "value": "us-east-1" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/patient-pipeline",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
+
