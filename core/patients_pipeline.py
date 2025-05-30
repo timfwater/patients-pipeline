@@ -4,7 +4,7 @@ import re
 import logging
 import os
 import boto3
-from openai import OpenAI
+import openai
 from datetime import datetime
 from datetime import timedelta
 import ast
@@ -15,6 +15,8 @@ import json
 
 # --- Load environment variables from .env file ---
 load_dotenv()
+
+openai.api_key = os.environ["OPENAI_API_KEY"]
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -70,10 +72,9 @@ def extract_risk_score(text):
     return None
 
 def get_chat_response(inquiry_note, model="gpt-3.5-turbo", retries=3, delay=5):
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     for attempt in range(retries):
         try:
-            response = client.chat.completions.create(
+            response = openai.ChatCompletion.create(
                 model=model,
                 messages=[{"role": "user", "content": inquiry_note}]
             )
