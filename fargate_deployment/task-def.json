@@ -28,7 +28,10 @@
         { "name": "START_DATE", "value": "2024-05-01" },
         { "name": "END_DATE", "value": "2024-05-07" },
         { "name": "PHYSICIAN_ID_LIST", "value": "1" },
-        { "name": "AWS_REGION", "value": "us-east-1" }
+        { "name": "AWS_REGION", "value": "us-east-1" },
+        { "name": "AUDIT_BUCKET", "value": "medical-note-llm" },
+		{ "name": "AUDIT_PREFIX", "value": "audit_logs" }
+
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
