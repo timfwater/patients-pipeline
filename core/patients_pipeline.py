@@ -6,6 +6,7 @@ import os
 import boto3
 from openai import OpenAI
 from datetime import datetime
+from datetime import timedelta
 import ast
 import warnings
 import time
@@ -124,15 +125,25 @@ def main():
     email_to = os.environ["EMAIL_TO"]
     email_from = os.environ["EMAIL_FROM"]
     threshold = float(os.environ.get("THRESHOLD", 0.95))
-    start_date = pd.to_datetime(os.environ.get("START_DATE", "2024-05-01"))
-    end_date = pd.to_datetime(os.environ.get("END_DATE", "2024-05-07"))
+    logger.info(f"📊 Using risk threshold: {threshold}")
     physician_ids_raw = os.environ.get("PHYSICIAN_ID_LIST", "").strip()
+
+        # --- Dynamic default date range (past 7 days) ---
+    try:
+        start_date = pd.to_datetime(os.environ.get("START_DATE"))
+        end_date = pd.to_datetime(os.environ.get("END_DATE"))
+        if pd.isna(start_date) or pd.isna(end_date):
+            raise ValueError
+    except Exception:
+        today = datetime.utcnow().date()
+        start_date = pd.to_datetime(today - timedelta(days=7))
+        end_date = pd.to_datetime(today)
+        logger.info(f"🗓️ No dates provided. Using default range: {start_date.date()} to {end_date.date()}")
 
     input_bucket, input_key = input_s3.replace("s3://", "").split("/", 1)
     output_bucket, output_key = output_s3.replace("s3://", "").split("/", 1)
 
     local_input = '/tmp/input.csv'
-    local_output = '/tmp/output.csv'
 
     s3 = boto3.client('s3', region_name=os.environ.get("AWS_REGION", "us-east-1"))
     logger.info(f"🪣 About to download from S3: bucket={input_bucket}, key={input_key}")
@@ -214,7 +225,10 @@ def main():
 
     if df_email.empty:
         logger.info("No high-risk patients in selected date range.")
-        return
+        logger.info("📭 Skipping email notification.")
+        email_sent = False
+    else:
+        email_sent = True
 
     sections = []
     for _, row in df_email.iterrows():
@@ -262,20 +276,23 @@ Your Clinical Risk Bot
     summary = {
         "timestamp": datetime.utcnow().isoformat(),
         "physician_id": os.getenv("PHYSICIAN_ID_LIST"),
-        "date_start": os.getenv("DATE_START"),
-        "date_end": os.getenv("DATE_END"),
+        "date_start": os.getenv("START_DATE"),
+        "date_end": os.getenv("END_DATE"),
         "total_notes": len(df),
-        "high_risk_count": df['risk_score'].notna().sum(),
-        "email_sent": high_risk_df is not None and not high_risk_df.empty,
+        "high_risk_count": len(high_risk_df) if 'high_risk_df' in locals() else 0,
+        "email_sent": email_sent,
         "output_path": f"s3://{output_bucket}/{output_key}",
         "run_duration_sec": round(time.time() - start_time, 2),
         "ecs_task_id": os.getenv("TASK_ID")
     }
 
-    audit_bucket = "medical-note-llm"
-    audit_key = f"audit_logs/{datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%SZ')}_summary.json"
+    audit_bucket = os.environ.get("AUDIT_BUCKET", output_bucket)
+    audit_prefix = os.environ.get("AUDIT_PREFIX", "audit_logs")
+    audit_key = f"{audit_prefix}/{datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%SZ')}_summary.json"
+
     log_audit_summary(s3, audit_bucket, audit_key, summary)
     logger.info(f"✅ Audit log written to s3://{audit_bucket}/{audit_key}")
+    logger.info("📝 Run summary:\n" + json.dumps(summary, indent=2))
     logger.info("⏱️ Script completed in %.2f seconds", time.time() - start_time)
 
 if __name__ == "__main__":
