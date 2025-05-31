@@ -27,7 +27,9 @@ openai.api_key = get_openai_key_from_secrets()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
 
-print("✅ SCRIPT IS RUNNING")
+logger.info("✅ SCRIPT IS RUNNING")
+logger.info(f"📡 ECS log stream: {os.getenv('LOG_STREAM', 'unknown')}")  
+logger.info(f"🆔 ECS task ID: {os.getenv('TASK_ID')}")
 
 # --- Prompts ---
 RISK_PROMPT = (
@@ -88,7 +90,7 @@ def get_ecs_metadata_task_id():
 
 # Set task ID in environment (used in audit logging)
 ecs_task_id = get_ecs_metadata_task_id()
-os.environ["TASK_ID"] = ecs_task_id or "unknown"
+os.environ["TASK_ID"] = ecs_task_id or "unknown"  
 
 def extract_risk_score(text):
     if not isinstance(text, str):
