@@ -1,86 +1,171 @@
-# 🧠 Agentic AI Risk Pipeline
+🧠 Agentic AI Risk Pipeline
 
-This project uses OpenAI's GPT model to analyze unstructured patient notes and identify high-risk patients needing follow-up care. The system automatically:
+This project demonstrates an end-to-end, agentic AI system for analyzing clinical notes and flagging high-risk patients. It integrates OpenAI GPT-based inference with AWS (S3, SES, EC2, Fargate) to automate risk scoring, care recommendations, reporting, and email delivery.
 
-1. Scores risk using LLM prompts.
-2. Recommends follow-up or specialist care.
-3. Emails a summary to stakeholders.
-4. Saves results + audit metadata to S3.
+✅ Key Features
 
----
+Scores patient risk using GPT-based prompts
 
-## 🚀 Deployment Options
+Recommends follow-up or specialist care
 
-| Method   | Status     |
-|----------|------------|
-| EC2 + Docker | ✅ Production-ready |
-| AWS Fargate (ECS) | ✅ Fully automated |
+Sends a summary email to clinicians
 
----
+Uploads merged output and audit log to S3
 
-## 📁 Input Format
+Supports both EC2 and fully serverless Fargate deployments
 
-`augmented_input.csv` (S3)
+🚀 Deployment Options
+
+The system supports two deployment modes:
+
+Method
+
+Description
+
+Status
+
+EC2 + Docker
+
+Manual Docker execution on EC2
+
+✅ Production-ready
+
+AWS Fargate
+
+Serverless ECS task (templated)
+
+✅ Fully automated
+
+EC2 Mode: Uses launch_ec2_pipeline_instance.sh to create an EC2, SSH, and run Docker.
+
+Fargate Mode: Uses generate_task_def.py and deploy_to_fargate.sh for seamless CLI deployment.
+
+📁 Input Format
+
+Input S3 file: augmented_input.csv
 
 Required columns:
-- `idx`: unique identifier
-- `visit_date`: datetime string (e.g. `2024-03-01`)
-- `full_note`: free-text provider note
-- `physician_id`: int
 
----
+idx: unique row ID
 
-## 🧠 Model Logic
+visit_date: YYYY-MM-DD
 
-| Prompt | Output |
-|--------|--------|
-| `RISK_PROMPT` | `risk_rating`, `risk_score` |
-| `COMBINED_PROMPT` (top N%) | follow-up + specialist recommendations |
+full_note: unstructured clinical text
 
----
+physician_id: int (for optional filtering)
 
-## 📧 Email Example
+🧐 Model Logic
 
-Summary email includes:
-- Patient ID, risk score
-- Follow-up: 1 month / 6 months
-- Top 5 medical concerns
-- Oncology/Cardiology flags
+Prompt
 
----
+Output columns
 
-## ✅ Output
+RISK_PROMPT
 
-- `output.csv` → full merged result
-- `audit_logs/*.json` → ECS metadata, runtime, filters, high-risk count, email flag
+risk_rating, risk_score
 
----
+COMBINED_PROMPT
 
-## 🔐 Secrets & Env Vars
+followup_1mo, cardiology_flag, ...
 
-Stored via AWS:
-- OpenAI API Key → Secrets Manager: `openai/api-key`
+Follow-up questions are asked only for top N% risk patients (configurable).
 
-Passed via `.env` or task definition:
+📧 Email Summary
 
-| Name | Purpose |
-|------|---------|
-| `INPUT_S3` | `s3://.../augmented_input.csv` |
-| `OUTPUT_S3` | `s3://.../output.csv` |
-| `EMAIL_TO` / `EMAIL_FROM` | SES email routing |
-| `PHYSICIAN_ID_LIST` | Optional comma-separated filter |
-| `START_DATE` / `END_DATE` | Optional YYYY-MM-DD filters |
+Generated email includes:
 
----
+Patient ID and risk score
 
-## 🛠️ Fargate Deployment
+Flags: follow-up (1/6 mo), oncology, cardiology
 
-Sample CLI launch:
+Top 5 extracted medical concerns
 
-```bash
+✅ Output Files
+
+output.csv (merged input + model results)
+
+audit_logs/*.json (runtime metadata, filters used, counts, flags)
+
+🔐 Secrets & Env Vars
+
+Stored securely via AWS:
+
+OpenAI Key in Secrets Manager → openai/api-key
+
+Defined via env or ECS task:
+
+Name
+
+Purpose
+
+INPUT_S3
+
+S3 URI to input CSV
+
+OUTPUT_S3
+
+Output path on S3
+
+EMAIL_TO
+
+SES destination address
+
+EMAIL_FROM
+
+SES verified sender
+
+PHYSICIAN_ID_LIST
+
+Optional filtering (comma-separated)
+
+START_DATE / END_DATE
+
+Filter input by visit_date
+
+THRESHOLD
+
+Risk score percentile cutoff (0-1)
+
+AWS_REGION
+
+Deployment region (e.g. us-east-1)
+
+🚧 Fargate CLI Example
+
 aws ecs run-task \
   --cluster patient-pipeline-cluster \
   --launch-type FARGATE \
   --network-configuration ... \
   --task-definition patient-pipeline-task:XX \
   --overrides file://env-overrides.json
+
+Task defs and overrides generated via:
+
+generate_task_def.py
+
+deploy_to_fargate.sh
+
+📆 Project Tree (Key Files)
+
+├── patients_pipeline.py          # Main pipeline script
+├── Dockerfile                    # Image config
+├── run_project                   # Menu to launch EC2 or Fargate
+├── ec2_deployment/               # EC2-specific scripts and env
+│   └── launch_ec2_pipeline_instance.sh
+├── fargate_deployment/           # Fargate deploy logic
+│   ├── task-def-template.json
+│   ├── generate_task_def.py
+│   └── deploy_to_fargate.sh
+
+📊 Goals & Highlights
+
+✅ Deploy a fully automated note-to-alert pipeline
+
+✅ Apply LLMs in clinical triage scenarios
+
+✅ Use AWS-native services securely and scalably
+
+📧 Contact
+
+Timothy Watermantimfwater [at] gmail [dot] com
+
