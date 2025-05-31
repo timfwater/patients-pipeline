@@ -5,20 +5,23 @@ import logging
 import os
 import boto3
 import openai
-from datetime import datetime
-from datetime import timedelta
+from datetime import datetime, timedelta
 import ast
 import warnings
 import time
-from dotenv import load_dotenv
 import json
+import requests
 
-# --- Load environment variables from .env file ---
-load_dotenv()
+# --- Retrieve OpenAI API key from AWS Secrets Manager ---
+def get_openai_key_from_secrets(secret_name="openai/api-key", region_name="us-east-1"):
+    try:
+        client = boto3.client("secretsmanager", region_name=region_name)
+        response = client.get_secret_value(SecretId=secret_name)
+        return response["SecretString"]
+    except Exception as e:
+        raise RuntimeError(f"❌ Failed to retrieve OpenAI API key from Secrets Manager: {e}")
 
-openai.api_key = os.environ["OPENAI_API_KEY"]
-
-warnings.filterwarnings("ignore", category=UserWarning)
+openai.api_key = get_openai_key_from_secrets()
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -61,6 +64,32 @@ Top Medical Concerns:
 """
 
 # --- Utility Functions ---
+
+def get_ecs_metadata_task_id():
+    try:
+        metadata_uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
+        if not metadata_uri:
+            return None
+        resp = requests.get(f"{metadata_uri}/task")
+        if resp.ok:
+            data = resp.json()
+            task_arn = data.get("TaskARN", "")
+            task_id = task_arn.split("/")[-1]
+            # Optional: fetch log stream name
+            containers = data.get("Containers", [])
+            if containers:
+                log_opts = containers[0].get("LogOptions", {})
+                log_stream = log_opts.get("awslogs-stream")
+                os.environ["LOG_STREAM"] = log_stream or "unknown"
+            return task_id
+    except Exception as e:
+        logger.warning(f"Could not retrieve ECS metadata: {e}")
+    return None
+
+# Set task ID in environment (used in audit logging)
+ecs_task_id = get_ecs_metadata_task_id()
+os.environ["TASK_ID"] = ecs_task_id or "unknown"
+
 def extract_risk_score(text):
     if not isinstance(text, str):
         return None
@@ -129,7 +158,7 @@ def main():
     logger.info(f"📊 Using risk threshold: {threshold}")
     physician_ids_raw = os.environ.get("PHYSICIAN_ID_LIST", "").strip()
 
-        # --- Dynamic default date range (past 7 days) ---
+    # --- Dynamic default date range (past 7 days) ---
     try:
         start_date = pd.to_datetime(os.environ.get("START_DATE"))
         end_date = pd.to_datetime(os.environ.get("END_DATE"))
@@ -143,11 +172,10 @@ def main():
 
     input_bucket, input_key = input_s3.replace("s3://", "").split("/", 1)
     output_bucket, output_key = output_s3.replace("s3://", "").split("/", 1)
-
     local_input = '/tmp/input.csv'
 
     s3 = boto3.client('s3', region_name=os.environ.get("AWS_REGION", "us-east-1"))
-    logger.info(f"🪣 About to download from S3: bucket={input_bucket}, key={input_key}")
+    logger.info(f"🪣 Downloading from S3: bucket={input_bucket}, key={input_key}")
     try:
         s3.download_file(input_bucket, input_key, local_input)
         logger.info("✅ Download succeeded.")
@@ -155,9 +183,9 @@ def main():
         logger.error(f"❌ S3 download failed: {e}")
         raise
 
-    logger.info("Loading input CSV...")
+    logger.info("📥 Loading input CSV...")
     df = pd.read_csv(local_input)
-    logger.info(f"Input rows loaded: {len(df)}")
+    logger.info(f"Loaded {len(df)} rows.")
 
     required_cols = ["idx", "visit_date", "full_note", "physician_id"]
     missing = [col for col in required_cols if col not in df.columns]
@@ -173,7 +201,7 @@ def main():
         try:
             physician_id_filter = [int(x.strip()) for x in physician_ids_raw.split(",") if x.strip().isdigit()]
             if not physician_id_filter:
-                logger.warning("PHYSICIAN_ID_LIST provided but no valid IDs were parsed.")
+                logger.warning("PHYSICIAN_ID_LIST provided but no valid IDs parsed.")
                 physician_id_filter = None
         except Exception as e:
             logger.error(f"Failed to parse PHYSICIAN_ID_LIST: {e}")
@@ -189,8 +217,7 @@ def main():
         logger.warning("No records matched physician/date filters.")
         return
 
-    logger.info(f"Filtered DataFrame has {len(df_filtered)} rows.")
-    logger.info("Running risk assessments...")
+    logger.info(f"Filtered {len(df_filtered)} rows. Running risk assessments...")
     df_filtered['risk_rating'] = df_filtered['full_note'].apply(lambda note: get_chat_response(RISK_PROMPT + note)['message']['content'])
     df_filtered['risk_score'] = df_filtered['risk_rating'].apply(extract_risk_score)
 
@@ -198,35 +225,32 @@ def main():
         logger.warning("No valid risk scores.")
         return
 
-    logger.info("Generating care recommendations...")
+    logger.info("⚕️ Generating care recommendations...")
     high_risk_df = df_filtered.nlargest(int((1 - threshold) * len(df_filtered)), 'risk_score')
     df_filtered.loc[high_risk_df.index, 'combined_response'] = high_risk_df['full_note'].apply(query_combined_prompt)
 
-    logger.info("Parsing care recommendations...")
+    logger.info("🧠 Parsing care recommendation responses...")
     parsed = df_filtered['combined_response'].dropna().apply(parse_response_and_concerns)
     df_filtered[parsed.columns] = parsed
 
-    # Re-assign high_risk_df to include parsed fields
     high_risk_df = df_filtered.loc[high_risk_df.index].copy()
 
-    columns_to_keep = [
+    columns_to_merge = [
         "idx", "visit_date", "risk_rating", "risk_score", "combined_response",
         "follow_up_1mo", "follow_up_6mo", "oncology_rec", "cardiology_rec", "top_concerns"
     ]
-    columns_to_merge = [col for col in columns_to_keep if col in df_filtered.columns]
     df_final = df_original.merge(df_filtered[columns_to_merge], on=["idx", "visit_date"], how="left")
 
     csv_buffer = StringIO()
     df_final.to_csv(csv_buffer, index=False)
     s3.put_object(Bucket=output_bucket, Key=output_key, Body=csv_buffer.getvalue())
-    logger.info("✅ Output written to S3")
+    logger.info("✅ Final output written to S3.")
 
     df_email = high_risk_df.copy()
-    logger.info(f"Rows with high risk score: {len(df_email)}")
+    logger.info(f"📨 Preparing email for {len(df_email)} high-risk patients...")
 
     if df_email.empty:
-        logger.info("No high-risk patients in selected date range.")
-        logger.info("📭 Skipping email notification.")
+        logger.info("No high-risk patients detected — skipping email.")
         email_sent = False
     else:
         email_sent = True
@@ -235,7 +259,7 @@ def main():
     for _, row in df_email.iterrows():
         concerns_lines = str(row.get('top_concerns', '')).strip().split('\n')
         concerns_formatted = '\n'.join(f"    {line.strip()}" for line in concerns_lines if line.strip())
-        note = f"""📋 Patient ID: {row['idx']}
+        section = f"""📋 Patient ID: {row['idx']}
     Visit Date: {row['visit_date']}
     Risk Score: {row['risk_score']}
     Follow-up 1 Month: {row.get('follow_up_1mo', 'N/A')}
@@ -245,7 +269,7 @@ def main():
     Top Medical Concerns:
 {concerns_formatted}
     ----------------------------------------"""
-        sections.append(note)
+        sections.append(section)
 
     email_body = f"""
 Hello Team,
@@ -259,20 +283,21 @@ Regards,
 Your Clinical Risk Bot
 """
 
-    try:
-        logger.info("Sending email via SES...")
-        ses = boto3.client("ses", region_name="us-east-1")
-        response = ses.send_email(
-            Source=email_from,
-            Destination={"ToAddresses": [email_to]},
-            Message={
-                "Subject": {"Data": "High-Risk Patient Report", "Charset": "UTF-8"},
-                "Body": {"Text": {"Data": email_body, "Charset": "UTF-8"}}
-            }
-        )
-        logger.info("✅ Email sent! Message ID: %s", response["MessageId"])
-    except Exception as e:
-        logger.error("❌ Failed to send email: %s", e)
+    if email_sent:
+        try:
+            logger.info("📧 Sending email via SES...")
+            ses = boto3.client("ses", region_name="us-east-1")
+            response = ses.send_email(
+                Source=email_from,
+                Destination={"ToAddresses": [email_to]},
+                Message={
+                    "Subject": {"Data": "High-Risk Patient Report", "Charset": "UTF-8"},
+                    "Body": {"Text": {"Data": email_body, "Charset": "UTF-8"}}
+                }
+            )
+            logger.info("✅ Email sent! Message ID: %s", response["MessageId"])
+        except Exception as e:
+            logger.error(f"❌ Failed to send email: {e}")
 
     summary = {
         "timestamp": datetime.utcnow().isoformat(),
@@ -280,21 +305,24 @@ Your Clinical Risk Bot
         "date_start": os.getenv("START_DATE"),
         "date_end": os.getenv("END_DATE"),
         "total_notes": len(df),
-        "high_risk_count": len(high_risk_df) if 'high_risk_df' in locals() else 0,
+        "high_risk_count": len(high_risk_df),
         "email_sent": email_sent,
         "output_path": f"s3://{output_bucket}/{output_key}",
         "run_duration_sec": round(time.time() - start_time, 2),
-        "ecs_task_id": os.getenv("TASK_ID")
+        "ecs_task_id": os.getenv("TASK_ID"),
+        "ecs_log_stream": os.getenv("LOG_STREAM", "unknown")
     }
 
-    audit_bucket = os.environ.get("AUDIT_BUCKET", output_bucket)
-    audit_prefix = os.environ.get("AUDIT_PREFIX", "audit_logs")
+    audit_bucket = os.getenv("AUDIT_BUCKET", output_bucket)
+    audit_prefix = os.getenv("AUDIT_PREFIX", "audit_logs")
     audit_key = f"{audit_prefix}/{datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%SZ')}_summary.json"
 
     log_audit_summary(s3, audit_bucket, audit_key, summary)
-    logger.info(f"✅ Audit log written to s3://{audit_bucket}/{audit_key}")
-    logger.info("📝 Run summary:\n" + json.dumps(summary, indent=2))
-    logger.info("⏱️ Script completed in %.2f seconds", time.time() - start_time)
+    logger.info(f"📁 Audit log written to s3://{audit_bucket}/{audit_key}")
+    logger.info("📊 Run Summary:\n" + json.dumps(summary, indent=2))
+    logger.info("✅ Script completed in %.2f seconds", time.time() - start_time)
+
 
 if __name__ == "__main__":
     main()
+

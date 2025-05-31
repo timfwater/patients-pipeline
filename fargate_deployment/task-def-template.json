@@ -1,0 +1,23 @@
+{
+  "family": "patient-pipeline-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "REPLACE_EXEC_ROLE",
+  "containerDefinitions": [
+    {
+      "name": "patient-pipeline",
+      "image": "REPLACE_IMAGE_URI",
+      "essential": true,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/patient-pipeline",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
