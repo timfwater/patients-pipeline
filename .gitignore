@@ -19,3 +19,7 @@ __pycache__/
 .vscode/
 .idea/
 
+# 📊 Ignore all other CSVs except the sample
+*.csv
+!patient_note_sample.csv
+
