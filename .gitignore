@@ -4,6 +4,7 @@
 .env.*
 env.list
 *.env.list
+config.env
 
 # 📦 Python cache
 __pycache__/
