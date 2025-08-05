@@ -6,21 +6,19 @@ env.list
 *.env.list
 config.env
 
+# Ignore generated ECS task definition
+fargate_deployment/final-task-def.json
+
 # 📦 Python cache
 __pycache__/
 *.py[cod]
 
-# 🧪 Jupyter/Notebook cache (if ever used)
-.ipynb_checkpoints/
-
 # 🧼 macOS system clutter
 .DS_Store
 
-# 🚫 Local editor settings (optional)
-.vscode/
-.idea/
+# Ignore temporary deployment artifacts
+*.log
 
-# 📊 Ignore all other CSVs except the sample
-*.csv
-!patient_note_sample.csv
+#Ignore IAM policy JSONs
+fargate_deployment/policies/*.json
 
