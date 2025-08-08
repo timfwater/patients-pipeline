@@ -23,5 +23,4 @@ __pycache__/
 *.log
 
 #Ignore IAM policy JSONs
-fargate_deployment/policies/*.json
 
