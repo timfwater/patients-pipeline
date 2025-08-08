@@ -9,6 +9,9 @@ config.env
 # Ignore generated ECS task definition
 fargate_deployment/final-task-def.json
 
+fargate_deployment/templates/final-task-def.json
+fargate_deployment/task-def.json
+
 # 📦 Python cache
 __pycache__/
 *.py[cod]
