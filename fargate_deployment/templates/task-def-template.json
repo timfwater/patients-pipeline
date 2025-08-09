@@ -5,6 +5,9 @@
   "cpu": "512",
   "memory": "1024",
   "executionRoleArn": "REPLACE_EXEC_ROLE",
+  "taskRoleArn": "REPLACE_TASK_ROLE",
+  "ephemeralStorage": { "sizeInGiB": 30 },
+  "runtimePlatform": { "operatingSystemFamily": "LINUX", "cpuArchitecture": "X86_64" },
   "containerDefinitions": [
     {
       "name": "patient-pipeline",

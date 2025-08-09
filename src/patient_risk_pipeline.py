@@ -11,6 +11,11 @@ import warnings
 import time
 import json
 import requests
+import random  # NEW
+
+# --- Config knobs (env-overridable) ---
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")        # NEW
+GLOBAL_THROTTLE = float(os.getenv("OPENAI_THROTTLE_SEC", "0") or 0)  # NEW
 
 # --- Retrieve OpenAI API key from AWS Secrets Manager ---
 def get_openai_key_from_secrets(secret_name="openai/api-key", region_name="us-east-1"):
@@ -28,7 +33,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
 
 logger.info("✅ SCRIPT IS RUNNING")
-logger.info(f"📡 ECS log stream: {os.getenv('LOG_STREAM', 'unknown')}")  
+logger.info(f"📡 ECS log stream: {os.getenv('LOG_STREAM', 'unknown')}")
 logger.info(f"🆔 ECS task ID: {os.getenv('TASK_ID')}")
 
 # --- Prompts ---
@@ -72,7 +77,7 @@ def get_ecs_metadata_task_id():
         metadata_uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
         if not metadata_uri:
             return None
-        resp = requests.get(f"{metadata_uri}/task")
+        resp = requests.get(f"{metadata_uri}/task", timeout=2)  # small timeout
         if resp.ok:
             data = resp.json()
             task_arn = data.get("TaskARN", "")
@@ -90,7 +95,7 @@ def get_ecs_metadata_task_id():
 
 # Set task ID in environment (used in audit logging)
 ecs_task_id = get_ecs_metadata_task_id()
-os.environ["TASK_ID"] = ecs_task_id or "unknown"  
+os.environ["TASK_ID"] = ecs_task_id or "unknown"
 
 def extract_risk_score(text):
     if not isinstance(text, str):
@@ -102,18 +107,38 @@ def extract_risk_score(text):
             return score / 100.0
     return None
 
-def get_chat_response(inquiry_note, model="gpt-3.5-turbo", retries=3, delay=5):
+# --- UPDATED: robust OpenAI caller with backoff + jitter + optional throttle ---
+def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.5, max_delay=20):
+    """
+    Calls OpenAI ChatCompletion with exponential backoff and jitter.
+    Respects GLOBAL_THROTTLE (seconds) between calls if set via env OPENAI_THROTTLE_SEC.
+    """
+    last_err = None
     for attempt in range(retries):
         try:
-            response = openai.ChatCompletion.create(
+            if GLOBAL_THROTTLE > 0:
+                time.sleep(GLOBAL_THROTTLE)
+            resp = openai.ChatCompletion.create(
                 model=model,
-                messages=[{"role": "user", "content": inquiry_note}]
+                messages=[{"role": "user", "content": inquiry_note}],
+                timeout=60,  # seconds
             )
-            return {"message": {"content": response.choices[0].message.content}}
+            return {"message": {"content": resp.choices[0].message.content}}
         except Exception as e:
-            logger.warning(f"Attempt {attempt+1} failed: {e}")
-            time.sleep(delay)
-    logger.error("All retries failed for OpenAI API.")
+            last_err = e
+            msg = str(e).lower()
+            # Treat common 429/5xx/network as transient
+            transient = any(s in msg for s in [
+                "rate limit", "server is overloaded", "overloaded", "503", "timeout",
+                "temporarily unavailable", "connection", "bad gateway", "gateway timeout", "service unavailable"
+            ])
+            if not transient and attempt >= 1:
+                logger.warning(f"Non-transient OpenAI error on attempt {attempt+1}: {e}")
+                break
+            sleep_s = min(max_delay, base_delay * (2 ** attempt)) * (0.5 + random.random())
+            logger.warning(f"Attempt {attempt+1} failed: {e}. Backing off {sleep_s:.1f}s...")
+            time.sleep(sleep_s)
+    logger.error(f"All retries failed for OpenAI API. Last error: {last_err}")
     return {"message": {"content": ""}}
 
 def query_combined_prompt(note, template=COMBINED_PROMPT):
@@ -219,8 +244,12 @@ def main():
         logger.warning("No records matched physician/date filters.")
         return
 
-    logger.info(f"Filtered {len(df_filtered)} rows. Running risk assessments...")
-    df_filtered['risk_rating'] = df_filtered['full_note'].apply(lambda note: get_chat_response(RISK_PROMPT + note)['message']['content'])
+    logger.info(f"Filtered {len[df_filtered]} rows. Running risk assessments...") if False else logger.info(f"Filtered {len(df_filtered)} rows. Running risk assessments...")  # keep your log text identical
+
+    # Apply risk prompt (sequential). GLOBAL_THROTTLE + backoff will tame 429/503 bursts.
+    df_filtered['risk_rating'] = df_filtered['full_note'].apply(
+        lambda note: get_chat_response(RISK_PROMPT + note)['message']['content']
+    )
     df_filtered['risk_score'] = df_filtered['risk_rating'].apply(extract_risk_score)
 
     if df_filtered['risk_score'].dropna().empty:
@@ -327,4 +356,3 @@ Your Clinical Risk Bot
 
 if __name__ == "__main__":
     main()
-
