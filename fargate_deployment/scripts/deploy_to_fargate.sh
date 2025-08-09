@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# -------- Debug knob (optional) --------
+: "${DEBUG:=false}"
+$DEBUG && set -x
+
 # Load config
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck disable=SC1091
 source "$ROOT_DIR/config.env"
+
+# Fallbacks if not set in env/config
+: "${AWS_REGION:=$(aws configure get region 2>/dev/null || echo us-east-1)}"
 
 # If IMAGE_URI not set, try using the last built image
 if [[ -z "${IMAGE_URI:-}" && -f "$ROOT_DIR/.last_image_uri" ]]; then
@@ -18,8 +25,9 @@ fi
 : "${SUBNET_IDS:=${FARGATE_SUBNET_IDS:-}}"
 : "${SECURITY_GROUP_ID:=${FARGATE_SECURITY_GROUP_IDS%%,*}}"
 : "${CONTAINER_NAME:=${CONTAINER_NAME:-patient-pipeline}}"
+: "${OPENAI_SECRET_JSON_KEY:=OPENAI_API_KEY}"   # Only used if the secret is JSON
 
-# Resolve execution role ARN (prefer explicit ARN)
+# Resolve roles
 if [[ -n "${EXECUTION_ROLE_ARN:-}" ]]; then
   RESOLVED_EXEC_ROLE_ARN="$EXECUTION_ROLE_ARN"
 elif [[ -n "${EXECUTION_ROLE_NAME:-}" ]]; then
@@ -28,7 +36,6 @@ else
   echo "❌ Missing EXECUTION_ROLE_ARN or EXECUTION_ROLE_NAME in config.env"; exit 1
 fi
 
-# Resolve task role ARN (prefer explicit ARN)
 if [[ -n "${TASK_ROLE_ARN:-}" ]]; then
   RESOLVED_TASK_ROLE_ARN="$TASK_ROLE_ARN"
 elif [[ -n "${TASK_ROLE_NAME:-}" ]]; then
@@ -37,7 +44,7 @@ else
   echo "❌ Missing TASK_ROLE_ARN or TASK_ROLE_NAME in config.env"; exit 1
 fi
 
-# Resolve image URI (accept IMAGE_URI or ECR_REPO_URI; add :latest if no tag present)
+# Resolve image URI
 if [[ -z "${IMAGE_URI:-}" ]]; then
   if [[ -n "${ECR_REPO_URI:-}" ]]; then
     IMAGE_URI="$ECR_REPO_URI"
@@ -52,9 +59,15 @@ jq_bin() { command -v jq >/dev/null 2>&1 && echo jq || { echo "jq is required"; 
 JQ=$(jq_bin)
 
 echo "🚀 Deploying task to Fargate in $AWS_REGION"
+echo "ℹ️  Cluster=$CLUSTER_NAME  Image=$IMAGE_URI"
 
 # -------- Preflight: cluster exists? --------
-if ! aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" --query 'clusters[0].status' --output text >/dev/null 2>&1; then
+STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" --query 'clusters[0].status' --output text 2>/dev/null || echo "MISSING")
+if [[ "$STATUS" == "INACTIVE" ]]; then
+  echo "ℹ️  ECS cluster '$CLUSTER_NAME' is INACTIVE; recreating..."
+  aws ecs delete-cluster --cluster "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null 2>&1 || true
+  aws ecs create-cluster --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null
+elif [[ "$STATUS" != "ACTIVE" ]]; then
   echo "ℹ️  ECS cluster '$CLUSTER_NAME' not found; creating..."
   aws ecs create-cluster --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null
 fi
@@ -90,7 +103,7 @@ if [[ -z "${INPUT_S3:-}" ]]; then
   fi
 fi
 
-# ---- container environment to inject ----
+# ---- container env ----
 ENV_JSON=$(jq -n \
   --arg AWS_REGION        "${AWS_REGION}" \
   --arg INPUT_S3          "${INPUT_S3}" \
@@ -115,16 +128,44 @@ ENV_JSON=$(jq -n \
     {name:"EMAIL_TO",          value:$EMAIL_TO}
   ]')
 
-# ---- optional: secrets wiring ----
+# ---- secrets injection (Secrets Manager preferred; plaintext fallback) ----
 SECRETS_JSON="[]"
-if [[ -n "${OPENAI_API_KEY_SECRET_NAME:-}" ]]; then
-  if [[ "$OPENAI_API_KEY_SECRET_NAME" == arn:* ]]; then
-    SECRET_ARN="$OPENAI_API_KEY_SECRET_NAME"
+SECRET_NAME="${OPENAI_API_KEY_SECRET_NAME:-}"
+PLAIN_API_KEY="${OPENAI_API_KEY:-}"
+
+if [[ -n "$SECRET_NAME" ]]; then
+  echo "🔐 Will inject OPENAI_API_KEY from Secrets Manager id: $SECRET_NAME"
+  if [[ "$SECRET_NAME" == arn:* ]]; then
+    SECRET_ARN="$SECRET_NAME"
   else
-    SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$OPENAI_API_KEY_SECRET_NAME" \
-                 --query 'ARN' --output text --region "$AWS_REGION")
+    set +e
+    SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$SECRET_NAME" --query 'ARN' --output text --region "$AWS_REGION" 2>/dev/null)
+    set -e
+    if [[ -z "$SECRET_ARN" || "$SECRET_ARN" == "None" ]]; then
+      echo "❌ Could not resolve secret '$SECRET_NAME' in region $AWS_REGION"; exit 1
+    fi
   fi
-  SECRETS_JSON=$(jq -n --arg arn "$SECRET_ARN" '[{name:"OPENAI_API_KEY", valueFrom:$arn}]')
+
+  # Detect JSON vs plaintext secret value
+  set +e
+  SECRET_STR=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" --query SecretString --output text 2>/dev/null)
+  set -e
+  if echo "${SECRET_STR:-}" | jq -e --arg k "$OPENAI_SECRET_JSON_KEY" 'try fromjson | has($k)' >/dev/null 2>&1; then
+    echo "ℹ️  Secret looks like JSON with key '$OPENAI_SECRET_JSON_KEY' → using :key:: suffix"
+    SECRET_SPEC="${SECRET_ARN}:${OPENAI_SECRET_JSON_KEY}::"
+  else
+    echo "ℹ️  Secret is plaintext → using plain ARN (no JSON key suffix)"
+    SECRET_SPEC="${SECRET_ARN}"
+  fi
+
+  SECRETS_JSON=$(jq -n --arg spec "$SECRET_SPEC" '[{name:"OPENAI_API_KEY", valueFrom:$spec}]')
+
+elif [[ -n "$PLAIN_API_KEY" ]]; then
+  echo "⚠️  Injecting OPENAI_API_KEY from plaintext env (fallback). Consider using Secrets Manager."
+  ENV_JSON=$(echo "$ENV_JSON" | $JQ '. + [{"name":"OPENAI_API_KEY","value":"'"$PLAIN_API_KEY"'"}]')
+else
+  echo "❌ Neither OPENAI_API_KEY_SECRET_NAME nor OPENAI_API_KEY present. Cannot proceed."
+  exit 1
 fi
 
 # -------- Build task definition from template --------
@@ -155,13 +196,17 @@ cat "$TEMPLATE" | $JQ \
   | .containerDefinitions[0].logConfiguration.options["awslogs-region"]=$logRegion
 ' > "$FINAL_TD"
 
-echo "📦 Registering task definition..."
+echo "🔍 Rendered secrets block:"
+$JQ '.containerDefinitions[0].secrets' "$FINAL_TD"
+
+# -------- Register task definition --------
+echo "📝 Registering task definition..."
 TD_ARN=$(aws ecs register-task-definition \
-  --cli-input-json "file://$FINAL_TD" \
-  --region "$AWS_REGION" \
+  --cli-input-json file://"$FINAL_TD" \
   --query 'taskDefinition.taskDefinitionArn' \
-  --output text)
-echo "✅ Registered: $TD_ARN"
+  --output text \
+  --region "$AWS_REGION")
+echo "📦 Registered: $TD_ARN"
 
 # -------- Network config --------
 IFS=',' read -r -a SUBNET_ARRAY <<< "$SUBNET_IDS"
@@ -186,33 +231,6 @@ if [[ -z "${ASSIGN_PUBLIC_IP:-}" || "${ASSIGN_PUBLIC_IP}" == "AUTO" ]]; then
   echo "ℹ️  ASSIGN_PUBLIC_IP auto-set to: $ASSIGN_PUBLIC_IP"
 fi
 
-# Optional sanity check for internet path when ASSIGN_PUBLIC_IP=ENABLED
-if [[ "${ASSIGN_PUBLIC_IP:-DISABLED}" == "ENABLED" ]]; then
-  echo "🔎 Quick network sanity check (public internet path)..."
-  for sn in "${SUBNET_ARRAY[@]}"; do
-    RTB_IDS=$(aws ec2 describe-route-tables --region "$AWS_REGION" \
-      --filters "Name=association.subnet-id,Values=$sn" \
-      --query 'RouteTables[].RouteTableId' --output text)
-    if [[ -z "$RTB_IDS" || "$RTB_IDS" == "None" ]]; then
-      VPC_ID=$(aws ec2 describe-subnets --subnet-ids "$sn" --region "$AWS_REGION" --query 'Subnets[0].VpcId' --output text)
-      RTB_IDS=$(aws ec2 describe-route-tables --region "$AWS_REGION" \
-        --filters "Name=vpc-id,Values=$VPC_ID" "Name=association.main,Values=true" \
-        --query 'RouteTables[].RouteTableId' --output text)
-    fi
-    HAS_IGW=$(aws ec2 describe-route-tables --route-table-ids $RTB_IDS --region "$AWS_REGION" \
-      --query 'RouteTables[].Routes[?DestinationCidrBlock==`0.0.0.0/0` && GatewayId!=null].GatewayId' --output text || true)
-    if [[ -z "$HAS_IGW" ]]; then
-      echo "⚠️  Subnet $sn does not appear to route 0.0.0.0/0 to an Internet Gateway. ECR pulls may fail."
-    fi
-  done
-else
-  echo "ℹ️  Using private subnets (assignPublicIp=DISABLED). Ensure a NAT + (optional) VPC endpoints exist for:"
-  echo "    - com.amazonaws.${AWS_REGION}.ecr.api"
-  echo "    - com.amazonaws.${AWS_REGION}.ecr.dkr"
-  echo "    - com.amazonaws.${AWS_REGION}.logs"
-  echo "    - com.amazonaws.${AWS_REGION}.secretsmanager (if using secrets)"
-fi
-
 # -------- Run task --------
 echo "🚀 Running task with assignPublicIp=${ASSIGN_PUBLIC_IP:-DISABLED}"
 RUN_OUT_JSON=$(aws ecs run-task \
@@ -221,9 +239,10 @@ RUN_OUT_JSON=$(aws ecs run-task \
   --task-definition "$TD_ARN" \
   --network-configuration "awsvpcConfiguration={subnets=[$(printf '"%s",' "${SUBNET_ARRAY[@]}" | sed 's/,$//')],securityGroups=[\"$SECURITY_GROUP_ID\"],assignPublicIp=${ASSIGN_PUBLIC_IP:-DISABLED}}" \
   --region "$AWS_REGION" \
+  --overrides '{"containerOverrides":[{"name":"'"$CONTAINER_NAME"'","environment":[]}]}'
   --output json)
 
-# Print any immediate API-level failures (wrong SG, bad subnets, etc.)
+# Print any immediate API-level failures
 FAILURES=$(echo "$RUN_OUT_JSON" | $JQ -r '.failures[]? | "\(.arn) \(.reason)"')
 if [[ -n "${FAILURES:-}" ]]; then
   echo "❌ run-task failures:"
@@ -250,7 +269,6 @@ echo "🧾 Task stopped. stoppedReason: ${STOPPED_REASON:-<none>}"
 [[ -n "$CONTAINER_REASON" ]] && echo "🧾 Container reason: $CONTAINER_REASON"
 [[ -n "$EXIT_CODE" && "$EXIT_CODE" != "null" ]] && echo "🧪 Exit code: $EXIT_CODE"
 
-# Fetch last 100 log events if possible
 echo "📜 Last 100 log events (if available):"
 aws logs get-log-events \
   --log-group-name "$LOG_GROUP" \
@@ -258,9 +276,7 @@ aws logs get-log-events \
   --limit 100 --region "$AWS_REGION" || true
 
 if [[ -z "$EXIT_CODE" || "$EXIT_CODE" == "null" ]]; then
-  echo "⚠️  No container exit code reported. This often indicates the task failed to pull the image (ECR auth/network)."
-  echo "   - If using private subnets, ensure NAT + ECR VPC endpoints."
-  echo "   - Otherwise set ASSIGN_PUBLIC_IP=ENABLED or keep AUTO with public subnets."
+  echo "⚠️  No container exit code reported. Likely image pull/network issue."
   exit 1
 fi
 

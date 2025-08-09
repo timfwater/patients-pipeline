@@ -61,7 +61,10 @@ fi
 
 # Helper: does tag already exist?
 tag_exists() {
-  aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="$TAG" --region "$AWS_REGION" >/dev/null 2>&1
+  aws ecr describe-images \
+    --repository-name "$REPO_NAME" \
+    --image-ids imageTag="$TAG" \
+    --region "$AWS_REGION" >/dev/null 2>&1
 }
 
 # Build + push (or skip)
@@ -80,12 +83,12 @@ else
   [[ -f "$ROOT_DIR/.dockerignore" ]] || yellow "ℹ️  Consider adding a .dockerignore to speed up builds."
 
   yellow "🔨 Building Docker image (platform linux/amd64 for Fargate)..."
-  # IMPORTANT: initialize array before expanding under `set -u`
-  BUILD_FLAGS=()
-  [[ "$NO_CACHE" == "true" ]] && BUILD_FLAGS+=(--no-cache)
+  # Use a scalar flag to avoid array expansion issues under 'set -u'
+  NO_CACHE_FLAG=""
+  [[ "${NO_CACHE}" == "true" ]] && NO_CACHE_FLAG="--no-cache"
 
   export DOCKER_BUILDKIT=1
-  docker build --platform linux/amd64 -t "${REPO_NAME}:${TAG}" "${BUILD_FLAGS[@]}" "$ROOT_DIR"
+  docker build --platform linux/amd64 -t "${REPO_NAME}:${TAG}" ${NO_CACHE_FLAG} "$ROOT_DIR"
   green "✅ Docker build complete."
 
   yellow "🏷️  Tagging image -> ${IMAGE_REPO}:${TAG}"
@@ -96,7 +99,7 @@ else
   green "✅ Docker push complete."
 fi
 
-# Save last image URI for deploy
+# Save last image URI for deploy (always)
 echo "${IMAGE_REPO}:${TAG}" > "$ROOT_DIR/.last_image_uri"
 cyan "📄 Saved image URI to $ROOT_DIR/.last_image_uri"
 green "🎯 Image ready: ${IMAGE_REPO}:${TAG}\n"

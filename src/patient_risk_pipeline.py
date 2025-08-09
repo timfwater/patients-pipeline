@@ -1,3 +1,5 @@
+# FILE: src/patient_risk_pipeline.py
+
 import pandas as pd
 from io import StringIO
 import re
@@ -11,22 +13,42 @@ import warnings
 import time
 import json
 import requests
-import random  # NEW
+import random  # backoff jitter
 
 # --- Config knobs (env-overridable) ---
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")        # NEW
-GLOBAL_THROTTLE = float(os.getenv("OPENAI_THROTTLE_SEC", "0") or 0)  # NEW
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+GLOBAL_THROTTLE = float(os.getenv("OPENAI_THROTTLE_SEC", "0") or 0)
 
-# --- Retrieve OpenAI API key from AWS Secrets Manager ---
-def get_openai_key_from_secrets(secret_name="openai/api-key", region_name="us-east-1"):
+# --- OpenAI API key resolution (env first, then Secrets Manager) ---
+def _get_openai_key_from_secrets(secret_name: str, region_name: str) -> str:
+    client = boto3.client("secretsmanager", region_name=region_name)
+    resp = client.get_secret_value(SecretId=secret_name)
+    return resp["SecretString"]
+
+def get_openai_key() -> str:
+    """
+    Prefer ECS-injected env var (OPENAI_API_KEY). If absent, fall back to
+    AWS Secrets Manager using OPENAI_API_KEY_SECRET_NAME or OPENAI_SECRET_NAME.
+    """
+    key = os.getenv("OPENAI_API_KEY")
+    if key:
+        return key
+
+    secret_name = (
+        os.getenv("OPENAI_API_KEY_SECRET_NAME")
+        or os.getenv("OPENAI_SECRET_NAME")
+        or "openai/api-key"
+    )
+    region = os.getenv("AWS_REGION", "us-east-1")
     try:
-        client = boto3.client("secretsmanager", region_name=region_name)
-        response = client.get_secret_value(SecretId=secret_name)
-        return response["SecretString"]
+        return _get_openai_key_from_secrets(secret_name, region)
     except Exception as e:
-        raise RuntimeError(f"❌ Failed to retrieve OpenAI API key from Secrets Manager: {e}")
+        raise RuntimeError(
+            f"❌ Failed to retrieve OpenAI API key from Secrets Manager "
+            f"(secret='{secret_name}', region='{region}'): {e}"
+        )
 
-openai.api_key = get_openai_key_from_secrets()
+openai.api_key = get_openai_key()
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -77,12 +99,11 @@ def get_ecs_metadata_task_id():
         metadata_uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
         if not metadata_uri:
             return None
-        resp = requests.get(f"{metadata_uri}/task", timeout=2)  # small timeout
+        resp = requests.get(f"{metadata_uri}/task", timeout=2)
         if resp.ok:
             data = resp.json()
             task_arn = data.get("TaskARN", "")
             task_id = task_arn.split("/")[-1]
-            # Optional: fetch log stream name
             containers = data.get("Containers", [])
             if containers:
                 log_opts = containers[0].get("LogOptions", {})
@@ -107,7 +128,7 @@ def extract_risk_score(text):
             return score / 100.0
     return None
 
-# --- UPDATED: robust OpenAI caller with backoff + jitter + optional throttle ---
+# --- Robust OpenAI caller with backoff + jitter + optional throttle ---
 def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.5, max_delay=20):
     """
     Calls OpenAI ChatCompletion with exponential backoff and jitter.
@@ -127,7 +148,6 @@ def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.
         except Exception as e:
             last_err = e
             msg = str(e).lower()
-            # Treat common 429/5xx/network as transient
             transient = any(s in msg for s in [
                 "rate limit", "server is overloaded", "overloaded", "503", "timeout",
                 "temporarily unavailable", "connection", "bad gateway", "gateway timeout", "service unavailable"
@@ -244,7 +264,7 @@ def main():
         logger.warning("No records matched physician/date filters.")
         return
 
-    logger.info(f"Filtered {len[df_filtered]} rows. Running risk assessments...") if False else logger.info(f"Filtered {len(df_filtered)} rows. Running risk assessments...")  # keep your log text identical
+    logger.info(f"Filtered {len(df_filtered)} rows. Running risk assessments...")
 
     # Apply risk prompt (sequential). GLOBAL_THROTTLE + backoff will tame 429/503 bursts.
     df_filtered['risk_rating'] = df_filtered['full_note'].apply(
@@ -257,7 +277,8 @@ def main():
         return
 
     logger.info("⚕️ Generating care recommendations...")
-    high_risk_df = df_filtered.nlargest(int((1 - threshold) * len(df_filtered)), 'risk_score')
+    top_n = max(1, int((1 - threshold) * len(df_filtered)))
+    high_risk_df = df_filtered.nlargest(top_n, 'risk_score')
     df_filtered.loc[high_risk_df.index, 'combined_response'] = high_risk_df['full_note'].apply(query_combined_prompt)
 
     logger.info("🧠 Parsing care recommendation responses...")
@@ -317,7 +338,7 @@ Your Clinical Risk Bot
     if email_sent:
         try:
             logger.info("📧 Sending email via SES...")
-            ses = boto3.client("ses", region_name="us-east-1")
+            ses = boto3.client("ses", region_name=os.environ.get("AWS_REGION", "us-east-1"))
             response = ses.send_email(
                 Source=email_from,
                 Destination={"ToAddresses": [email_to]},
