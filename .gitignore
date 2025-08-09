@@ -6,6 +6,12 @@ env.list
 *.env.list
 config.env
 
+# 📝 Logs & temp files
+*.log
+*.tmp
+*.bak
+.last_image_uri
+
 # Ignore generated ECS task definition
 fargate_deployment/final-task-def.json
 
