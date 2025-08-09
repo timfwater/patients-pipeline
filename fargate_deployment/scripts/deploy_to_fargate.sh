@@ -188,7 +188,7 @@ cat "$TEMPLATE" | $JQ \
   | .executionRoleArn=$execRole
   | .taskRoleArn=$taskRole
   | .containerDefinitions[0].image=$image
-  | .containerDefinitions[0].name="'$CONTAINER_NAME'"
+  | .containerDefinitions[0].name="'"$CONTAINER_NAME"'"
   | .containerDefinitions[0].environment=$env
   | .containerDefinitions[0].secrets=$secrets
   | .containerDefinitions[0].logConfiguration.options["awslogs-group"]=$logGroup
@@ -231,16 +231,23 @@ if [[ -z "${ASSIGN_PUBLIC_IP:-}" || "${ASSIGN_PUBLIC_IP}" == "AUTO" ]]; then
   echo "ℹ️  ASSIGN_PUBLIC_IP auto-set to: $ASSIGN_PUBLIC_IP"
 fi
 
+# Debug echo for quick sanity
+echo "NETCFG: subnets=[$SUBNET_IDS] sg=[$SECURITY_GROUP_ID] assignPublicIp=[$ASSIGN_PUBLIC_IP]"
+echo "ROLES: exec=$RESOLVED_EXEC_ROLE_ARN task=$RESOLVED_TASK_ROLE_ARN logGroup=$LOG_GROUP"
+
 # -------- Run task --------
 echo "🚀 Running task with assignPublicIp=${ASSIGN_PUBLIC_IP:-DISABLED}"
-RUN_OUT_JSON=$(aws ecs run-task \
-  --cluster "$CLUSTER_NAME" \
-  --launch-type FARGATE \
-  --task-definition "$TD_ARN" \
-  --network-configuration "awsvpcConfiguration={subnets=[$(printf '"%s",' "${SUBNET_ARRAY[@]}" | sed 's/,$//')],securityGroups=[\"$SECURITY_GROUP_ID\"],assignPublicIp=${ASSIGN_PUBLIC_IP:-DISABLED}}" \
-  --region "$AWS_REGION" \
-  --overrides '{"containerOverrides":[{"name":"'"$CONTAINER_NAME"'","environment":[]}]}'
-  --output json)
+RUN_OUT_JSON="$(
+  aws ecs run-task \
+    --cluster "$CLUSTER_NAME" \
+    --launch-type FARGATE \
+    --task-definition "$TD_ARN" \
+    --count 1 \
+    --network-configuration "awsvpcConfiguration={subnets=[$(printf '"%s",' "${SUBNET_ARRAY[@]}" | sed 's/,$//')],securityGroups=[\"$SECURITY_GROUP_ID\"],assignPublicIp=${ASSIGN_PUBLIC_IP:-DISABLED}}" \
+    --region "$AWS_REGION" \
+    --overrides '{"containerOverrides":[{"name":"'"$CONTAINER_NAME"'","environment":[]}]}' \
+    --output json
+)"
 
 # Print any immediate API-level failures
 FAILURES=$(echo "$RUN_OUT_JSON" | $JQ -r '.failures[]? | "\(.arn) \(.reason)"')
