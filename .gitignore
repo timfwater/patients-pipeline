@@ -1,35 +1,35 @@
-# 🔐 Sensitive files
+# 🔐 Sensitive files (never commit real creds/keys)
 *.pem
 .env
 .env.*
 env.list
 *.env.list
-config.env
+config.env        # real config (use config.env.example for reference)
+.last_image_uri   # build artifact with last image URI
 
 # 📝 Logs & temp files
 *.log
 *.tmp
 *.bak
-.last_image_uri
 
-# Ignore generated ECS task definition
-fargate_deployment/final-task-def.json
-
-fargate_deployment/templates/final-task-def.json
-fargate_deployment/task-def.json
-
-# 📦 Python cache
+# 📦 Python cache / build
 __pycache__/
 *.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 📓 Notebooks
+.ipynb_checkpoints/
 
 # 🧼 macOS system clutter
 .DS_Store
 
-# Ignore temporary deployment artifacts
-*.log
+# ====== Deployment Artifacts ======
+# ECS / Fargate generated task defs
+fargate_deployment/final-task-def.json
+fargate_deployment/templates/final-task-def.json
+fargate_deployment/task-def.json
 
-#Ignore IAM policy JSONs
-
-fargate_deployment/final-task-def.json
-fargate_deployment/final-task-def.json
-fargate_deployment/final-task-def.json
+# Optional: ignore IAM policies (but recommend versioning if shared)
+# fargate_deployment/policies/*.json

@@ -11,7 +11,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck disable=SC1091
 source "$ROOT_DIR/config.env"
 
-# Fallbacks if not set in env/config
+# Fallback region if not set
 : "${AWS_REGION:=$(aws configure get region 2>/dev/null || echo us-east-1)}"
 
 # If IMAGE_URI not set, try using the last built image
@@ -27,24 +27,21 @@ fi
 : "${CONTAINER_NAME:=${CONTAINER_NAME:-patient-pipeline}}"
 : "${OPENAI_SECRET_JSON_KEY:=OPENAI_API_KEY}"   # Only used if the secret is JSON
 
-# Resolve roles
-if [[ -n "${EXECUTION_ROLE_ARN:-}" ]]; then
-  RESOLVED_EXEC_ROLE_ARN="$EXECUTION_ROLE_ARN"
-elif [[ -n "${EXECUTION_ROLE_NAME:-}" ]]; then
-  RESOLVED_EXEC_ROLE_ARN="$(aws iam get-role --role-name "$EXECUTION_ROLE_NAME" --query 'Role.Arn' --output text)"
-else
-  echo "❌ Missing EXECUTION_ROLE_ARN or EXECUTION_ROLE_NAME in config.env"; exit 1
+# -------- Resolve roles (canonical first, legacy fallback) --------
+RESOLVED_EXEC_ROLE_ARN="${TASK_EXECUTION_ROLE:-${EXECUTION_ROLE_ARN:-}}"
+RESOLVED_TASK_ROLE_ARN="${TASK_ROLE:-${TASK_ROLE_ARN:-}}"
+
+if [[ -z "$RESOLVED_EXEC_ROLE_ARN" && -n "${EXECUTION_ROLE_NAME:-}" ]]; then
+  RESOLVED_EXEC_ROLE_ARN="$(aws iam get-role --role-name "$EXECUTION_ROLE_NAME" --query 'Role.Arn' --output text --region "$AWS_REGION")"
+fi
+if [[ -z "$RESOLVED_TASK_ROLE_ARN" && -n "${TASK_ROLE_NAME:-}" ]]; then
+  RESOLVED_TASK_ROLE_ARN="$(aws iam get-role --role-name "$TASK_ROLE_NAME" --query 'Role.Arn' --output text --region "$AWS_REGION")"
 fi
 
-if [[ -n "${TASK_ROLE_ARN:-}" ]]; then
-  RESOLVED_TASK_ROLE_ARN="$TASK_ROLE_ARN"
-elif [[ -n "${TASK_ROLE_NAME:-}" ]]; then
-  RESOLVED_TASK_ROLE_ARN="$(aws iam get-role --role-name "$TASK_ROLE_NAME" --query 'Role.Arn' --output text)"
-else
-  echo "❌ Missing TASK_ROLE_ARN or TASK_ROLE_NAME in config.env"; exit 1
-fi
+: "${RESOLVED_EXEC_ROLE_ARN:?Missing TASK_EXECUTION_ROLE (or legacy EXECUTION_ROLE_ARN/NAME) in config.env}"
+: "${RESOLVED_TASK_ROLE_ARN:?Missing TASK_ROLE (or legacy TASK_ROLE_ARN/NAME) in config.env}"
 
-# Resolve image URI
+# -------- Resolve image URI --------
 if [[ -z "${IMAGE_URI:-}" ]]; then
   if [[ -n "${ECR_REPO_URI:-}" ]]; then
     IMAGE_URI="$ECR_REPO_URI"
@@ -78,54 +75,59 @@ if ! aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --region 
   aws logs create-log-group --log-group-name "$LOG_GROUP" --region "$AWS_REGION"
 fi
 
-# ---- validate core app inputs ----
+# ---- validate core app inputs (keep light; script has defaults for dates) ----
 missing=()
+[[ -z "${INPUT_S3:-}" && ( -z "${S3_INPUT_BUCKET:-}" || -z "${INPUT_FILE:-}" ) ]] && missing+=("INPUT_S3 or (S3_INPUT_BUCKET+INPUT_FILE)")
 [[ -z "${OUTPUT_S3:-}" ]] && missing+=("OUTPUT_S3")
-[[ -z "${THRESHOLD:-}" ]] && missing+=("THRESHOLD")
-[[ -z "${START_DATE:-}" ]] && missing+=("START_DATE")
-[[ -z "${END_DATE:-}" ]] && missing+=("END_DATE")
 [[ -z "${EMAIL_FROM:-}" ]] && missing+=("EMAIL_FROM")
-[[ -z "${EMAIL_TO:-}" ]] && missing+=("EMAIL_TO")
-if [[ -z "${PHYSICIAN_ID:-}" && -z "${PHYSICIAN_ID_LIST:-}" ]]; then
-  missing+=("PHYSICIAN_ID or PHYSICIAN_ID_LIST")
-fi
+[[ -z "${EMAIL_TO:-}"   ]] && missing+=("EMAIL_TO")
+[[ -z "${THRESHOLD:-}"  ]] && missing+=("THRESHOLD")
 if ((${#missing[@]})); then
   echo "❌ Missing required config: ${missing[*]}"; exit 1
 fi
 
 # ---- derive INPUT_S3 if not provided ----
 if [[ -z "${INPUT_S3:-}" ]]; then
-  if [[ -n "${S3_INPUT_BUCKET:-}" && -n "${INPUT_FILE:-}" ]]; then
-    INPUT_S3="s3://${S3_INPUT_BUCKET}/Input/${INPUT_FILE}"
-    echo "ℹ️  Derived INPUT_S3=${INPUT_S3}"
-  else
-    echo "❌ Provide INPUT_S3 or both S3_INPUT_BUCKET and INPUT_FILE"; exit 1
-  fi
+  INPUT_S3="s3://${S3_INPUT_BUCKET}/Input/${INPUT_FILE}"
+  echo "ℹ️  Derived INPUT_S3=${INPUT_S3}"
 fi
 
-# ---- container env ----
+# ---- harmonize physician filters (script uses PHYSICIAN_ID_LIST) ----
+if [[ -z "${PHYSICIAN_ID_LIST:-}" && -n "${PHYSICIAN_ID:-}" ]]; then
+  PHYSICIAN_ID_LIST="$PHYSICIAN_ID"
+fi
+
+# ---- container env (now includes EMAIL_SUBJECT, LLM knobs, audit) ----
 ENV_JSON=$(jq -n \
   --arg AWS_REGION        "${AWS_REGION}" \
   --arg INPUT_S3          "${INPUT_S3}" \
   --arg OUTPUT_S3         "${OUTPUT_S3}" \
-  --arg PHYSICIAN_ID      "${PHYSICIAN_ID:-}" \
   --arg PHYSICIAN_ID_LIST "${PHYSICIAN_ID_LIST:-}" \
   --arg THRESHOLD         "${THRESHOLD}" \
-  --arg START_DATE        "${START_DATE}" \
-  --arg END_DATE          "${END_DATE}" \
+  --arg START_DATE        "${START_DATE:-}" \
+  --arg END_DATE          "${END_DATE:-}" \
   --arg EMAIL_FROM        "${EMAIL_FROM}" \
-  --arg EMAIL_TO          "${EMAIL_TO}" '
+  --arg EMAIL_TO          "${EMAIL_TO}" \
+  --arg EMAIL_SUBJECT     "${EMAIL_SUBJECT:-High-Risk Patient Report}" \
+  --arg OPENAI_MODEL      "${OPENAI_MODEL:-}" \
+  --arg OPENAI_THROTTLE   "${OPENAI_THROTTLE_SEC:-}" \
+  --arg AUDIT_BUCKET      "${AUDIT_BUCKET:-}" \
+  --arg AUDIT_PREFIX      "${AUDIT_PREFIX:-}" '
   [
     {name:"AWS_REGION",        value:$AWS_REGION},
     {name:"INPUT_S3",          value:$INPUT_S3},
     {name:"OUTPUT_S3",         value:$OUTPUT_S3},
-    {name:"PHYSICIAN_ID",      value:$PHYSICIAN_ID},
     {name:"PHYSICIAN_ID_LIST", value:$PHYSICIAN_ID_LIST},
     {name:"THRESHOLD",         value:$THRESHOLD},
     {name:"START_DATE",        value:$START_DATE},
     {name:"END_DATE",          value:$END_DATE},
     {name:"EMAIL_FROM",        value:$EMAIL_FROM},
-    {name:"EMAIL_TO",          value:$EMAIL_TO}
+    {name:"EMAIL_TO",          value:$EMAIL_TO},
+    {name:"EMAIL_SUBJECT",     value:$EMAIL_SUBJECT},
+    {name:"OPENAI_MODEL",      value:$OPENAI_MODEL},
+    {name:"OPENAI_THROTTLE_SEC", value:$OPENAI_THROTTLE},
+    {name:"AUDIT_BUCKET",      value:$AUDIT_BUCKET},
+    {name:"AUDIT_PREFIX",      value:$AUDIT_PREFIX}
   ]')
 
 # ---- secrets injection (Secrets Manager preferred; plaintext fallback) ----

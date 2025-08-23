@@ -22,6 +22,7 @@ S3_INPUT_BUCKET="${S3_INPUT_BUCKET:-}"
 S3_OUTPUT_BUCKET="$(echo "${OUTPUT_S3:-}" | sed -E 's#^s3://([^/]+)/?.*#\1#' || true)"
 SES_IDENTITY="${EMAIL_FROM:-}"
 OPENAI_API_KEY_SECRET_NAME="${OPENAI_API_KEY_SECRET_NAME:-}"
+# If true, grant the *task role* permission to fetch the secret at runtime.
 APP_FETCHES_OPENAI_SECRET_AT_RUNTIME="${APP_FETCHES_OPENAI_SECRET_AT_RUNTIME:-false}"
 
 command -v jq >/dev/null 2>&1 || { echo "jq is required"; exit 1; }
@@ -30,10 +31,11 @@ command -v jq >/dev/null 2>&1 || { echo "jq is required"; exit 1; }
 get_or_create_role () {
   local NAME="$1"
   local TRUST="$2"
-  if ! aws iam get-role --role-name "$NAME" >/dev/null 2>&1; then
+  if ! aws iam get-role --role-name "$NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
     aws iam create-role \
       --role-name "$NAME" \
-      --assume-role-policy-document "$TRUST" >/dev/null
+      --assume-role-policy-document "$TRUST" \
+      --region "$AWS_REGION" >/dev/null
     echo "✅ Created role $NAME"
   else
     echo "ℹ️ Role $NAME exists"
@@ -60,7 +62,8 @@ get_or_create_role "$EXECUTION_ROLE_NAME" "$EXEC_TRUST_DOC"
 # Attach AWS-managed ECS execution policy (ECR + logs)
 aws iam attach-role-policy \
   --role-name "$EXECUTION_ROLE_NAME" \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy >/dev/null 2>&1 || true
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy \
+  --region "$AWS_REGION" >/dev/null 2>&1 || true
 echo "🔗 Ensured AWS-managed AmazonECSTaskExecutionRolePolicy is attached to $EXECUTION_ROLE_NAME"
 
 # Resolve the specific secret ARN (tight scope for secrets + kms)
@@ -74,7 +77,7 @@ if [[ -n "$OPENAI_API_KEY_SECRET_NAME" ]]; then
   fi
 fi
 
-# Inline policy for logs + (tightly scoped) secret access
+# Inline policy for logs + (tightly scoped) secret access for injection path
 EXEC_INLINE_NAME="${POLICY_PREFIX}-ExecutionInline"
 EXEC_STATEMENTS='[
   {
@@ -116,11 +119,13 @@ EXEC_DOC=$(jq -n --argjson stmts "$EXEC_STATEMENTS" '{ "Version":"2012-10-17", "
 aws iam put-role-policy \
   --role-name "$EXECUTION_ROLE_NAME" \
   --policy-name "$EXEC_INLINE_NAME" \
-  --policy-document "$(printf '%s' "$EXEC_DOC")" >/devnull 2>&1 || \
+  --policy-document "$(printf '%s' "$EXEC_DOC")" \
+  --region "$AWS_REGION" >/dev/null 2>&1 || \
 aws iam put-role-policy \
   --role-name "$EXECUTION_ROLE_NAME" \
   --policy-name "$EXEC_INLINE_NAME" \
-  --policy-document "$(printf '%s' "$EXEC_DOC")" >/dev/null
+  --policy-document "$(printf '%s' "$EXEC_DOC")" \
+  --region "$AWS_REGION" >/dev/null
 echo "🔗 Applied inline policy to $EXECUTION_ROLE_NAME: $EXEC_INLINE_NAME"
 
 # ---------- Task role (your app: S3 + SES; optional secrets at runtime) ----------
@@ -171,11 +176,13 @@ TASK_INLINE_NAME="${POLICY_PREFIX}-TaskInline"
 aws iam put-role-policy \
   --role-name "$TASK_ROLE_NAME" \
   --policy-name "$TASK_INLINE_NAME" \
-  --policy-document "$(printf '%s' "$TASK_DOC")" >/devnull 2>&1 || \
+  --policy-document "$(printf '%s' "$TASK_DOC")" \
+  --region "$AWS_REGION" >/dev/null 2>&1 || \
 aws iam put-role-policy \
   --role-name "$TASK_ROLE_NAME" \
   --policy-name "$TASK_INLINE_NAME" \
-  --policy-document "$(printf '%s' "$TASK_DOC")" >/dev/null
+  --policy-document "$(printf '%s' "$TASK_DOC")" \
+  --region "$AWS_REGION" >/dev/null
 echo "🔗 Applied inline policy to $TASK_ROLE_NAME: $TASK_INLINE_NAME"
 
 echo "✅ IAM setup complete:
