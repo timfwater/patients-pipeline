@@ -31,3 +31,5 @@ __pycache__/
 #Ignore IAM policy JSONs
 
 fargate_deployment/final-task-def.json
+fargate_deployment/final-task-def.json
+fargate_deployment/final-task-def.json
