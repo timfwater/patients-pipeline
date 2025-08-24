@@ -1,35 +1,48 @@
-# 🔐 Sensitive files (never commit real creds/keys)
-*.pem
-.env
-.env.*
-env.list
-*.env.list
-config.env        # real config (use config.env.example for reference)
-.last_image_uri   # build artifact with last image URI
-
-# 📝 Logs & temp files
-*.log
-*.tmp
-*.bak
-
-# 📦 Python cache / build
+# Python
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+*.so
 *.egg-info/
+.build/
 dist/
-build/
+.venv/
+venv/
 
-# 📓 Notebooks
-.ipynb_checkpoints/
-
-# 🧼 macOS system clutter
+# macOS
 .DS_Store
 
-# ====== Deployment Artifacts ======
-# ECS / Fargate generated task defs
-fargate_deployment/final-task-def.json
-fargate_deployment/templates/final-task-def.json
-fargate_deployment/task-def.json
+# Env / secrets
+.env
+config.env
+*.env
 
-# Optional: ignore IAM policies (but recommend versioning if shared)
-# fargate_deployment/policies/*.json
+# Local state / cache
+.last_image_uri
+.cache/
+.ipynb_checkpoints/
+
+# Node (if any)
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# Tests artifacts
+.pytest_cache/
+
+# Docker context noise
+docker-context/
+config
+config.env
+*.env
+
+__pycache__/
+*.py[cod]
+*.pytest_cache/
+.pytest_cache/
+
+.last_image_uri
+fargate_deployment/final-task-def.json

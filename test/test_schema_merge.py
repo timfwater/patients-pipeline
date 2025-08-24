@@ -1,11 +1,12 @@
-# FILE: tests/test_schema_merge.py
+# FILE: test/test_schema_merge.py
 import pandas as pd
+from pandas.api.types import DatetimeTZDtype
 
 def test_merge_preserves_row_count_and_columns():
     # Original input rows
     df_original = pd.DataFrame({
         "idx": [1, 2, 3],
-        "visit_date": pd.to_datetime(["2024-05-01", "2024-05-02", "2024-05-03"]),
+        "visit_date": pd.to_datetime(["2024-05-01", "2024-05-02", "2024-05-03"], utc=True),
         "full_note": ["a", "b", "c"],
         "physician_id": [1, 1, 2],
     })
@@ -13,7 +14,7 @@ def test_merge_preserves_row_count_and_columns():
     # Simulated processed/filtered output
     df_filtered = pd.DataFrame({
         "idx": [1, 3],
-        "visit_date": pd.to_datetime(["2024-05-01", "2024-05-03"]),
+        "visit_date": pd.to_datetime(["2024-05-01", "2024-05-03"], utc=True),
         "risk_rating": ["Risk Score: 55", "Risk Score: 90"],
         "risk_score": [0.55, 0.90],
         "combined_response": ["...", "..."],
@@ -37,6 +38,9 @@ def test_merge_preserves_row_count_and_columns():
     # Expected columns exist
     for c in columns_to_merge:
         assert c in df_final.columns
+
+    # Date dtype remains timezone-aware datetime
+    assert isinstance(df_final["visit_date"].dtype, DatetimeTZDtype)
 
     # Rows without matches should have NaNs in merged columns (e.g., idx=2)
     row2 = df_final[df_final["idx"] == 2].iloc[0]

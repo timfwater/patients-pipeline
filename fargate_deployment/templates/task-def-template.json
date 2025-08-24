@@ -1,5 +1,5 @@
 {
-  "family": "patient-pipeline-task",
+  "family": "REPLACE_TASK_FAMILY",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "512",
@@ -7,20 +7,64 @@
   "executionRoleArn": "REPLACE_EXEC_ROLE",
   "taskRoleArn": "REPLACE_TASK_ROLE",
   "ephemeralStorage": { "sizeInGiB": 30 },
-  "runtimePlatform": { "operatingSystemFamily": "LINUX", "cpuArchitecture": "X86_64" },
+  "runtimePlatform": {
+    "operatingSystemFamily": "LINUX",
+    "cpuArchitecture": "X86_64"
+  },
   "containerDefinitions": [
     {
       "name": "patient-pipeline",
       "image": "REPLACE_IMAGE_URI",
       "essential": true,
+      "readonlyRootFilesystem": true,
+      "stopTimeout": 60,
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
-          "awslogs-group": "/ecs/patient-pipeline",
-          "awslogs-region": "us-east-1",
-          "awslogs-stream-prefix": "ecs"
+          "awslogs-group": "REPLACE_LOG_GROUP",
+          "awslogs-region": "REPLACE_AWS_REGION",
+          "awslogs-stream-prefix": "REPLACE_LOG_STREAM_PREFIX"
         }
-      }
+      },
+      "secrets": [
+        {
+          "name": "OPENAI_API_KEY",
+          "valueFrom": "REPLACE_OPENAI_SECRET_ARN"
+        }
+      ],
+      "environment": [
+        { "name": "AWS_REGION", "value": "REPLACE_AWS_REGION" },
+
+        { "name": "S3_INPUT_BUCKET", "value": "REPLACE_S3_INPUT_BUCKET" },
+        { "name": "S3_OUTPUT_BUCKET", "value": "REPLACE_S3_OUTPUT_BUCKET" },
+        { "name": "INPUT_S3", "value": "REPLACE_INPUT_S3" },
+        { "name": "OUTPUT_S3", "value": "REPLACE_OUTPUT_S3" },
+        { "name": "AUDIT_BUCKET", "value": "REPLACE_AUDIT_BUCKET" },
+        { "name": "AUDIT_PREFIX", "value": "REPLACE_AUDIT_PREFIX" },
+
+        { "name": "EMAIL_FROM", "value": "REPLACE_EMAIL_FROM" },
+        { "name": "EMAIL_TO", "value": "REPLACE_EMAIL_TO" },
+        { "name": "EMAIL_SUBJECT", "value": "REPLACE_EMAIL_SUBJECT" },
+
+        { "name": "PHYSICIAN_ID_LIST", "value": "REPLACE_PHYSICIAN_ID_LIST" },
+        { "name": "THRESHOLD", "value": "REPLACE_THRESHOLD" },
+        { "name": "START_DATE", "value": "REPLACE_START_DATE" },
+        { "name": "END_DATE", "value": "REPLACE_END_DATE" },
+
+        { "name": "OPENAI_MODEL", "value": "REPLACE_OPENAI_MODEL" },
+        { "name": "OPENAI_THROTTLE_SEC", "value": "REPLACE_OPENAI_THROTTLE_SEC" },
+
+        { "name": "DRY_RUN_EMAIL", "value": "REPLACE_DRY_RUN_EMAIL" },
+        { "name": "MAX_NOTES", "value": "REPLACE_MAX_NOTES" },
+
+        { "name": "LOG_GROUP", "value": "REPLACE_LOG_GROUP" },
+        { "name": "LOG_STREAM_PREFIX", "value": "REPLACE_LOG_STREAM_PREFIX" }
+      ],
+      "command": [
+        "python",
+        "-m",
+        "src.patient_risk_pipeline"
+      ]
     }
   ]
 }
