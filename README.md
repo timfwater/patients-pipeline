@@ -63,6 +63,7 @@ Subsequent prompts summarize top medical concerns and generate specialty-specifi
 
 📂 **Repo Structure**
 
+```text
 src/                        # Core pipeline logic
     patient_risk_pipeline.py   # Main entrypoint (CLI + ECS)
 
@@ -83,7 +84,7 @@ config.env.example           # Editable runtime configuration
 requirements.txt             # Python + test deps
 Dockerfile                   # Container build
 pytest.ini                   # Pytest config
-test/                        # Unit tests
+test/                        # Unit tests```
 
 
 🚀 **Quick Start**
