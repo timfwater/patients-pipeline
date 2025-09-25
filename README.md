@@ -103,11 +103,11 @@ test/                        # Unit tests
 
 🚀 Quick Start
 
-# 1. Configure environment
+1. Configure environment
 cp config.env.example config.env
 # Edit with AWS account, region, S3 paths, SES emails, etc.
 
-# 2. Deploy + run end-to-end
+2. Deploy + run end-to-end
 cd fargate_deployment/scripts
 ./run_all.sh
 
@@ -166,13 +166,13 @@ SES Sandbox: requires verifying EMAIL_FROM and EMAIL_TO.
 
 🎉 Demo Workflow
 
-# One-time IAM setup
+One-time IAM setup
 ./fargate_deployment/scripts/setup_iam.sh
 
-# Run full pipeline
+Run full pipeline
 ./fargate_deployment/scripts/deploy_to_fargate.sh
 
-# Fetch outputs locally
+Fetch outputs locally
 ./fargate_deployment/scripts/fetch_artifacts.sh
 
 Artifacts appear in /tmp/patient-pipeline-artifacts/ and your SES inbox.
