@@ -1,4 +1,4 @@
-🧠 Agentic AI Patient Risk Pipeline
+🧠 ###Agentic AI Patient Risk Pipeline
 
 📌 Overview
 
@@ -58,21 +58,6 @@ Expectation: consistent numeric risk scores (1–100) + concise justifications
 
 Narrowing: follow-up prompts only triggered for high-risk cases
 
-Example initial risk-assessment prompt:
-
-Please assume the role of a primary care physician.  
-Based on the following patient summary text, provide a single risk rating between 1 and 100 
-for the patient's need for follow-up care within the next year, 
-with 1 being nearly no risk and 100 being the greatest risk.  
-
-Respond in the following format:
-
-Risk Score: <numeric_value>
-<Brief explanation or justification here (optional)>
-
-Here is the patient summary:
-<NOTE_TEXT>
-
 Subsequent prompts summarize top medical concerns and generate specialty-specific follow-up recommendations.
 
 
@@ -105,7 +90,7 @@ test/                        # Unit tests
 
 1. Configure environment
 cp config.env.example config.env
-# Edit with AWS account, region, S3 paths, SES emails, etc.
+ Edit with AWS account, region, S3 paths, SES emails, etc.
 
 2. Deploy + run end-to-end
 cd fargate_deployment/scripts
