@@ -1,13 +1,13 @@
-🧠 #Agentic AI Patient Risk Pipeline
+# 🧠 **Agentic AI Patient Risk Pipeline**
 
-📌 Overview
+📌 **Overview**
 
 This project implements a fully containerized agentic AI workflow for analyzing clinical notes.
 It runs on AWS ECS Fargate and uses OpenAI’s GPT models to surface high-risk patients and generate actionable summaries for clinicians.
 
 Input: CSV patient notes in S3 (s3://<bucket>/Input/)
 
-Processing:
+**Processing:**
 
 Retrieve OpenAI API key securely from AWS Secrets Manager
 
@@ -17,7 +17,7 @@ Append results to the input CSV and save to S3 Output/
 
 Send a summary email to clinicians via SES
 
-Output:
+**Output:**
 
 Annotated CSVs in S3 (s3://<bucket>/Output/)
 
@@ -28,14 +28,14 @@ SES email listing high-risk patients
 ⚠️ Clinical disclaimer: This pipeline does not replace clinicians. All flagged cases must be manually reviewed by qualified professionals before action is taken.
 
 
-🏗 Architecture
+🏗 **Architecture**
 
 S3 (Input CSVs) ──► ECS Fargate Task ──► S3 (Output CSVs)
  │
  ├──► OpenAI GPT (risk scoring + recommendations)
  └──► SES (summary email to clinicians)
 
-Key principles:
+**Key principles:**
 
 Human-in-the-loop: clinicians review all outputs
 
@@ -44,7 +44,7 @@ Security: Secrets Manager for API keys, least-privilege IAM roles
 Traceability: logs + outputs stored in S3
 
 
-🧾 Prompt Design (RISEN Framework)
+🧾 **Prompt Design (RISEN Framework)**
 
 Prompt engineering followed the RISEN framework (Role, Input, Steps, Expectation, Narrowing):
 
@@ -61,7 +61,7 @@ Narrowing: follow-up prompts only triggered for high-risk cases
 Subsequent prompts summarize top medical concerns and generate specialty-specific follow-up recommendations.
 
 
-📂 Repo Structure
+📂 **Repo Structure**
 
 src/                        # Core pipeline logic
     patient_risk_pipeline.py   # Main entrypoint (CLI + ECS)
@@ -86,7 +86,7 @@ pytest.ini                   # Pytest config
 test/                        # Unit tests
 
 
-🚀 Quick Start
+🚀 **Quick Start**
 
 1. Configure environment
 cp config.env.example config.env
@@ -97,7 +97,7 @@ cd fargate_deployment/scripts
 ./run_all.sh
 
 
-Results:
+**Results:**
 
 ✅ Output CSV written to your S3 Output/ path
 
@@ -105,7 +105,7 @@ Results:
 
 ✅ Audit JSON stored in Audit/ S3 prefix
 
-⏱ Scheduling
+⏱ **Scheduling**
 
 The pipeline can be automated with EventBridge:
 
@@ -130,7 +130,7 @@ Custom: run on demand for specific clinician IDs, time windows, or thresholds
 | `LOG_LEVEL`     | Logging verbosity                             | `DEBUG`                          |
 
 
-🧪 Testing
+🧪 **Testing**
 
 Run local unit tests (no AWS calls):
 
@@ -138,7 +138,7 @@ pip install -r requirements.txt
 pytest
 
 
-🔒 Security Notes
+🔒 **Security Notes**
 
 Secrets: API keys stored in AWS Secrets Manager, not committed.
 
@@ -149,7 +149,7 @@ SES Sandbox: requires verifying EMAIL_FROM and EMAIL_TO.
 .gitignore: prevents leaking config/env secrets.
 
 
-🎉 Demo Workflow
+🎉 **Demo Workflow**
 
 One-time IAM setup
 ./fargate_deployment/scripts/setup_iam.sh
@@ -163,7 +163,7 @@ Fetch outputs locally
 Artifacts appear in /tmp/patient-pipeline-artifacts/ and your SES inbox.
 
 
-📊 Future Directions
+📊 **Future Directions**
 
 Interactive review portal (web UI)
 
@@ -173,5 +173,5 @@ Multi-modal input (labs, imaging, notes)
 
 © 2025 Timothy Waterman • Hosted project website
 
-Github:
+**Github:**
 https://github.com/timfwater/patients-pipeline
