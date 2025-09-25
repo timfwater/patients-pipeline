@@ -1,5 +1,4 @@
 # FILE: src/patient_risk_pipeline.py
-
 import os
 import re
 import io
@@ -22,6 +21,8 @@ import openai
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 GLOBAL_THROTTLE = float(os.getenv("OPENAI_THROTTLE_SEC", "0") or 0)
 LLM_DISABLED = os.getenv("LLM_DISABLED", "false").lower() == "true"  # for fast smoke tests
+CSV_CHUNK_ROWS = int(os.getenv("CSV_CHUNK_ROWS", "5000"))  # streaming chunk size
+OUTPUT_TMP = os.getenv("OUTPUT_TMP", "/tmp/output.csv")    # local rolling output
 
 # =========
 # Logging
@@ -173,7 +174,6 @@ def extract_risk_score(text):
     """
     if not isinstance(text, str):
         return None
-    # Allow flexible whitespace, case-insensitive, and optional decimals
     m = re.search(r'\brisk\s*score\s*:\s*([0-9]+(?:\.[0-9]+)?)\b', text, flags=re.IGNORECASE)
     if not m:
         return None
@@ -193,7 +193,6 @@ def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.
     If LLM_DISABLED=true, returns a deterministic stub.
     """
     if LLM_DISABLED:
-        # Deterministic stub for tests: produce mid-risk and a simple combined answer
         if inquiry_note.strip().startswith("Please assume the role"):
             return {"message": {"content": "Risk Score: 72\nLikely follow-up needed."}}
         else:
@@ -213,7 +212,7 @@ def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.
             resp = openai.ChatCompletion.create(
                 model=model,
                 messages=[{"role": "user", "content": inquiry_note}],
-                timeout=60,  # seconds
+                timeout=60,
             )
             return {"message": {"content": resp.choices[0].message.content}}
         except Exception as e:
@@ -237,14 +236,7 @@ def query_combined_prompt(note, template=COMBINED_PROMPT):
     response = get_chat_response(prompt)['message']['content']
     return response
 
-# --- Improved parsing for the combined prompt output ---
 def safe_split(line, label):
-    """
-    Accepts e.g.:
-      "Follow-up 1 month: yes"
-      "follow_up 1 Month :  Yes"
-    and returns the RHS if the LHS roughly matches the label.
-    """
     try:
         lhs, rhs = line.split(":", 1)
         if re.sub(r"\s+", "", lhs).lower().startswith(re.sub(r"\s+", "", label).lower()):
@@ -254,30 +246,15 @@ def safe_split(line, label):
     return None
 
 def parse_response_and_concerns(text):
-    """
-    Expected shape (your format), but robust to case/spacing:
-      Follow-up 1 month: <Yes/No>
-      Follow-up 6 months: <Yes/No>
-      Oncology recommended: <Yes/No>
-      Cardiology recommended: <Yes/No>
-      (blank line ok)
-      Top Medical Concerns:
-      1. ...
-      2. ...
-      ...
-    """
     try:
         lines = [l.strip() for l in str(text).strip().splitlines() if l.strip() != ""]
         f1mo = f6mo = onc = card = None
         concerns_text = ""
-
-        # find concerns header index (case-insensitive)
         concerns_idx = None
         for i, l in enumerate(lines):
             if re.sub(r"\s+", "", l).lower().startswith("topmedicalconcerns"):
                 concerns_idx = i
                 break
-
         header_slice = lines[:concerns_idx] if concerns_idx is not None else lines[:4]
         for l in header_slice:
             v = safe_split(l, "Follow-up 1 month")
@@ -288,11 +265,9 @@ def parse_response_and_concerns(text):
             if v is not None: onc = v; continue
             v = safe_split(l, "Cardiology recommended")
             if v is not None: card = v; continue
-
         if concerns_idx is not None:
             concerns_lines = lines[concerns_idx+1:]
             concerns_text = "\n".join(cl.strip() for cl in concerns_lines)
-
         return pd.Series(
             [f1mo, f6mo, onc, card, concerns_text],
             index=["follow_up_1mo", "follow_up_6mo", "oncology_rec", "cardiology_rec", "top_concerns"],
@@ -329,57 +304,8 @@ def s3_put_text(s3_client, bucket, key, text, retries=3):
             time.sleep(delay)
             delay *= 2
 
-# --- Chunked streaming from S3 to keep memory flat ---
-def iter_filtered_chunks_from_s3(
-    s3_client,
-    bucket: str,
-    key: str,
-    start_date: pd.Timestamp,
-    end_date: pd.Timestamp,
-    physician_id_filter: list[int] | None,
-    max_rows: int,
-    chunksize: int = 5000,
-):
-    """
-    Stream and filter the CSV from S3 in chunks to keep memory flat.
-    Yields filtered DataFrames until max_rows (if >0) is reached.
-    """
-    obj = s3_client.get_object(Bucket=bucket, Key=key)
-    body = io.TextIOWrapper(obj["Body"], encoding="utf-8")
-
-    usecols = ["idx", "visit_date", "full_note", "physician_id"]
-    dtypes = {"idx": "int64", "physician_id": "int64"}
-    taken = 0
-
-    for chunk in pd.read_csv(
-        body,
-        usecols=usecols,
-        dtype=dtypes,
-        parse_dates=["visit_date"],
-        chunksize=chunksize,
-    ):
-        # Filter by date + physician
-        mask = (chunk["visit_date"] >= start_date) & (chunk["visit_date"] <= end_date)
-        if physician_id_filter:
-            mask &= chunk["physician_id"].isin(physician_id_filter)
-        filt = chunk.loc[mask]
-
-        # Respect MAX_NOTES cap
-        if max_rows and max_rows > 0 and not filt.empty:
-            remaining = max_rows - taken
-            if remaining <= 0:
-                break
-            filt = filt.head(remaining)
-
-        if not filt.empty:
-            yield filt
-            taken += len(filt)
-
-        if max_rows and taken >= max_rows:
-            break
-
 # =========
-# Main (now with CLI)
+# Main (streaming, chunked)
 # =========
 def run_pipeline(
     input_s3: str,
@@ -417,15 +343,12 @@ def run_pipeline(
     output_bucket, output_key = output_s3.replace("s3://", "").split("/", 1)
 
     s3 = boto3.client('s3', region_name=aws_region)
-    logger.info(f"🛶 Streaming & filtering from S3 in chunks: s3://{input_bucket}/{input_key}")
 
-    # Physician filter parsing
+    # Physician filter
     physician_id_filter = None
     if physician_ids_raw:
         try:
-            physician_id_filter = [
-                int(x.strip()) for x in physician_ids_raw.split(",") if x.strip().isdigit()
-            ]
+            physician_id_filter = [int(x.strip()) for x in physician_ids_raw.split(",") if x.strip().isdigit()]
             if not physician_id_filter:
                 logger.warning("PHYSICIAN_ID_LIST provided but no valid IDs parsed.")
                 physician_id_filter = None
@@ -433,148 +356,137 @@ def run_pipeline(
             logger.error(f"Failed to parse PHYSICIAN_ID_LIST: {e}")
             physician_id_filter = None
 
-    # Build filtered working set with tiny memory footprint
-    filtered_parts = []
-    for part in iter_filtered_chunks_from_s3(
-        s3_client=s3,
-        bucket=input_bucket,
-        key=input_key,
-        start_date=start_date,
-        end_date=end_date,
-        physician_id_filter=physician_id_filter,
-        max_rows=max_notes,  # 0 means 'no cap'
-        chunksize=5000,
-    ):
-        filtered_parts.append(part)
+    # Ensure output file is clean
+    try:
+        if os.path.exists(OUTPUT_TMP):
+            os.remove(OUTPUT_TMP)
+    except Exception:
+        pass
 
-    if not filtered_parts:
-        logger.warning("No records matched physician/date filters.")
-        # Write schema-consistent (but empty) CSV with expected columns.
-        columns = [
-            "idx", "visit_date", "full_note", "physician_id",
-            "risk_rating", "risk_score", "combined_response",
-            "follow_up_1mo", "follow_up_6mo", "oncology_rec", "cardiology_rec", "top_concerns"
-        ]
-        empty_df = pd.DataFrame(columns=columns)
-        csv_buffer = StringIO()
-        empty_df.to_csv(csv_buffer, index=False)
-        s3_put_text(s3, output_bucket, output_key, csv_buffer.getvalue())
-        logger.info("✅ Final (empty) output written to S3 due to no matches.")
+    total_rows = 0
+    total_high_risk = 0
+    remaining_to_score = max_notes if max_notes > 0 else float("inf")
+    wrote_header = False
 
-        summary = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "physician_id": physician_ids_raw,
-            "date_start": start_date_str,
-            "date_end": end_date_str,
-            "total_notes": 0,
-            "high_risk_count": 0,
-            "email_sent": False,
-            "output_path": f"s3://{output_bucket}/{output_key}",
-            "run_duration_sec": round(time.time() - start_time, 2),
-            "ecs_task_id": os.getenv("TASK_ID"),
-            "ecs_log_stream": os.getenv("LOG_STREAM", "unknown"),
-            "run_id": os.getenv("RUN_ID", "unknown"),
-        }
-        audit_bucket = os.getenv("AUDIT_BUCKET", output_bucket)
-        audit_prefix = os.getenv("AUDIT_PREFIX", "audit_logs")
-        audit_key = f"{audit_prefix}/{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')}_summary.json"
-        log_audit_summary(s3, audit_bucket, audit_key, summary)
-        logger.info(f"📁 Audit log written to s3://{audit_bucket}/{audit_key}")
-        return
+    logger.info(f"🛶 Streaming CSV from S3 in chunks of ~{CSV_CHUNK_ROWS} rows...")
+    # Requires s3fs installed
+    read_opts = dict(storage_options={"client_kwargs": {"region_name": aws_region}}, chunksize=CSV_CHUNK_ROWS)
 
-    df_filtered = pd.concat(filtered_parts, ignore_index=True)
-    logger.info(f"Filtered {len(df_filtered)} rows (chunked build).")
+    try:
+        chunk_iter = pd.read_csv(input_s3, **read_opts)
+    except TypeError:
+        # Older pandas: chunksize is separate param
+        chunk_iter = pd.read_csv(input_s3, storage_options={"client_kwargs": {"region_name": aws_region}}, iterator=True, chunksize=CSV_CHUNK_ROWS)
 
-    # Optional cap (already applied in iterator, but keep for safety)
-    if max_notes > 0 and len(df_filtered) > max_notes:
-        logger.info(f"✂️  MAX_NOTES={max_notes} active; truncating from {len(df_filtered)} rows.")
-        df_filtered = df_filtered.head(max_notes).copy()
+    for chunk_idx, df in enumerate(chunk_iter, start=1):
+        total_rows += len(df)
 
-    logger.info("Running risk assessments...")
-    # Apply risk prompt sequentially; GLOBAL_THROTTLE + backoff tame 429/503 bursts.
-    df_filtered['risk_rating'] = df_filtered['full_note'].apply(
-        lambda note: get_chat_response(RISK_PROMPT + str(note))['message']['content']
-    )
-    df_filtered['risk_score'] = df_filtered['risk_rating'].apply(extract_risk_score)
+        # Validate columns on first chunk
+        if chunk_idx == 1:
+            required_cols = ["idx", "visit_date", "full_note", "physician_id"]
+            missing_cols = [c for c in required_cols if c not in df.columns]
+            if missing_cols:
+                logger.error(f"Missing required columns: {missing_cols}")
+                # Write pass-through with empty annotation columns
+                df_final = df.copy()
+                for c in ["risk_rating","risk_score","combined_response","follow_up_1mo","follow_up_6mo","oncology_rec","cardiology_rec","top_concerns"]:
+                    if c not in df_final.columns: df_final[c] = None
+                df_final.to_csv(OUTPUT_TMP, index=False, mode="w")
+                s3.upload_file(OUTPUT_TMP, output_bucket, output_key)
+                summary = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "physician_id": physician_ids_raw,
+                    "date_start": start_date_str,
+                    "date_end": end_date_str,
+                    "total_notes": total_rows,
+                    "high_risk_count": 0,
+                    "email_sent": False,
+                    "output_path": f"s3://{output_bucket}/{output_key}",
+                    "run_duration_sec": round(time.time() - start_time, 2),
+                    "ecs_task_id": os.getenv("TASK_ID"),
+                    "ecs_log_stream": os.getenv("LOG_STREAM", "unknown"),
+                    "warning": f"Missing required input columns: {missing_cols}",
+                }
+                audit_bucket = os.getenv("AUDIT_BUCKET", output_bucket)
+                audit_prefix = os.getenv("AUDIT_PREFIX", "audit_logs")
+                audit_key = f"{audit_prefix}/{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')}_summary.json"
+                log_audit_summary(s3, audit_bucket, audit_key, summary)
+                logger.info(f"📁 Audit log written to s3://{audit_bucket}/{audit_key}")
+                raise SystemExit(2)
 
-    if df_filtered['risk_score'].dropna().empty:
-        logger.warning("No valid risk scores.")
-        # Output only filtered structure (no matches scored)
-        out_df = df_filtered.copy()
-        for c in ["combined_response","follow_up_1mo","follow_up_6mo","oncology_rec","cardiology_rec","top_concerns"]:
-            if c not in out_df.columns: out_df[c] = None
-        csv_buffer = StringIO()
-        out_df.to_csv(csv_buffer, index=False)
-        s3_put_text(s3, output_bucket, output_key, csv_buffer.getvalue())
-        logger.info("✅ Final output (no scores) written to S3.")
+        # Normalize types
+        df['visit_date'] = pd.to_datetime(df['visit_date'], errors='coerce')
 
-        summary = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "physician_id": physician_ids_raw,
-            "date_start": start_date_str,
-            "date_end": end_date_str,
-            "total_notes": int(len(df_filtered)),
-            "high_risk_count": 0,
-            "email_sent": False,
-            "output_path": f"s3://{output_bucket}/{output_key}",
-            "run_duration_sec": round(time.time() - start_time, 2),
-            "ecs_task_id": os.getenv("TASK_ID"),
-            "ecs_log_stream": os.getenv("LOG_STREAM", "unknown")
-        }
-        audit_bucket = os.getenv("AUDIT_BUCKET", output_bucket)
-        audit_prefix = os.getenv("AUDIT_PREFIX", "audit_logs")
-        audit_key = f"{audit_prefix}/{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')}_summary.json"
-        log_audit_summary(s3, audit_bucket, audit_key, summary)
-        logger.info(f"📁 Audit log written to s3://{audit_bucket}/{audit_key}")
-        return
+        # Build filtered view for scoring
+        mask = (df['visit_date'] >= start_date) & (df['visit_date'] <= end_date)
+        if physician_id_filter:
+            mask &= df['physician_id'].isin(physician_id_filter)
 
-    # ---- Threshold-based selection for second prompt ----
-    logger.info("⚕️ Selecting high-risk rows using threshold...")
-    df_filtered["risk_score"] = pd.to_numeric(df_filtered["risk_score"], errors="coerce")
-    high_mask = df_filtered["risk_score"] >= threshold
-    high_risk_idx = df_filtered.index[high_mask]
+        df["risk_rating"] = None
+        df["risk_score"] = None
+        df["combined_response"] = None
+        df["follow_up_1mo"] = None
+        df["follow_up_6mo"] = None
+        df["oncology_rec"] = None
+        df["cardiology_rec"] = None
+        df["top_concerns"] = None
 
-    if len(high_risk_idx) == 0:
-        logger.info("No rows meet the risk threshold for recommendations.")
-        df_filtered["combined_response"] = None
-    else:
-        logger.info("Generating combined recommendations for %d rows...", len(high_risk_idx))
-        df_filtered.loc[high_risk_idx, "combined_response"] = (
-            df_filtered.loc[high_risk_idx, "full_note"].apply(query_combined_prompt)
+        # Nothing to score in this chunk? still append passthrough rows
+        if not mask.any() or remaining_to_score == 0:
+            df.to_csv(OUTPUT_TMP, index=False, mode=("a" if wrote_header else "w"), header=not wrote_header)
+            wrote_header = True
+            continue
+
+        df_to_score = df.loc[mask].copy()
+
+        # Enforce MAX_NOTES budget across chunks
+        if remaining_to_score < len(df_to_score):
+            df_to_score = df_to_score.head(remaining_to_score)
+
+        # ---- Risk scoring
+        logger.info(f"🧪 Chunk {chunk_idx}: scoring {len(df_to_score)} notes (budget remaining before: {remaining_to_score})")
+        df_to_score['risk_rating'] = df_to_score['full_note'].apply(
+            lambda note: get_chat_response(RISK_PROMPT + str(note))['message']['content']
         )
+        df_to_score['risk_score'] = df_to_score['risk_rating'].apply(extract_risk_score)
+        remaining_to_score -= len(df_to_score)
 
-    logger.info("🧠 Parsing care recommendation responses...")
-    parsed = df_filtered["combined_response"].dropna().apply(parse_response_and_concerns)
-    if not parsed.empty:
-        df_filtered[parsed.columns] = parsed
+        # ---- Recommendations for high risk rows
+        if df_to_score['risk_score'].notna().any():
+            high_mask = df_to_score['risk_score'] >= threshold
+            n_high = int(high_mask.sum())
+            total_high_risk += n_high
+            if n_high > 0:
+                df_to_score.loc[high_mask, "combined_response"] = df_to_score.loc[high_mask, "full_note"].apply(query_combined_prompt)
+                parsed = df_to_score.loc[high_mask, "combined_response"].dropna().apply(parse_response_and_concerns)
+                if not parsed.empty:
+                    df_to_score.loc[parsed.index, parsed.columns] = parsed
 
-    high_risk_df = df_filtered.loc[high_risk_idx].copy()
+        # ---- Write out this chunk (annotated rows merged back by index)
+        df.update(df_to_score)  # aligns on index; only overwrites rows we scored
+        df.to_csv(OUTPUT_TMP, index=False, mode=("a" if wrote_header else "w"), header=not wrote_header)
+        wrote_header = True
 
-    # ---- Write output (only filtered set to avoid OOM) ----
-    columns_out = [
-        "idx", "visit_date", "full_note", "physician_id",
-        "risk_rating", "risk_score", "combined_response",
-        "follow_up_1mo", "follow_up_6mo", "oncology_rec", "cardiology_rec", "top_concerns"
-    ]
-    out_df = df_filtered.reindex(columns=columns_out)
-    csv_buffer = StringIO()
-    out_df.to_csv(csv_buffer, index=False)
-    s3_put_text(s3, output_bucket, output_key, csv_buffer.getvalue())
+    # Upload the completed CSV once
+    s3.upload_file(OUTPUT_TMP, output_bucket, output_key)
     logger.info("✅ Final output written to S3.")
 
-    # ---- Email summary (only if there are high-risk rows) ----
-    df_email = high_risk_df.copy()
-    logger.info(f"📨 Preparing email for {len(df_email)} high-risk patients...")
-
+    # Prepare email body from just the high-risk rows we actually evaluated
     email_sent = False
-    if not df_email.empty:
+    if total_high_risk > 0:
+        # Re-read only high-risk rows from the produced output (streaming) to build the email
+        # This is cheap because we're only formatting text, not calling the LLM again.
+        df_out_iter = pd.read_csv(OUTPUT_TMP, chunksize=CSV_CHUNK_ROWS)
         sections = []
-        for _, row in df_email.iterrows():
-            concerns_lines = str(row.get('top_concerns', '')).strip().split('\n')
-            concerns_formatted = '\n'.join(f"    {line.strip()}" for line in concerns_lines if line.strip())
-            section = f"""📋 Patient ID: {row['idx']}
-    Visit Date: {row['visit_date']}
-    Risk Score: {row['risk_score']}
+        for odf in df_out_iter:
+            odf['risk_score'] = pd.to_numeric(odf.get('risk_score'), errors='coerce')
+            hi = odf[odf['risk_score'] >= threshold]
+            for _, row in hi.iterrows():
+                concerns_lines = str(row.get('top_concerns', '')).strip().split('\n')
+                concerns_formatted = '\n'.join(f"    {line.strip()}" for line in concerns_lines if line.strip())
+                section = f"""📋 Patient ID: {row.get('idx')}
+    Visit Date: {row.get('visit_date')}
+    Risk Score: {row.get('risk_score')}
     Follow-up 1 Month: {row.get('follow_up_1mo', 'N/A')}
     Follow-up 6 Months: {row.get('follow_up_6mo', 'N/A')}
     Oncology Recommended: {row.get('oncology_rec', 'N/A')}
@@ -582,9 +494,10 @@ def run_pipeline(
     Top Medical Concerns:
 {concerns_formatted}
     ----------------------------------------"""
-            sections.append(section)
+                sections.append(section)
 
-        email_body = f"""
+        if sections:
+            email_body = f"""
 Hello Team,
 
 Please review the following high-risk patient notes and follow-up recommendations
@@ -595,34 +508,33 @@ from {start_date.date()} to {end_date.date()}:
 Regards,
 Your Clinical Risk Bot
 """
-        if dry_run_email:
-            logger.info("🧪 DRY_RUN_EMAIL=true — skipping SES send. Email body below:\n" + email_body)
-            email_sent = False
-        else:
-            try:
-                logger.info("📧 Sending email via SES...")
-                ses = boto3.client("ses", region_name=aws_region)
-                resp = ses.send_email(
-                    Source=email_from,
-                    Destination={"ToAddresses": [email_to]},
-                    Message={
-                        "Subject": {"Data": email_subject, "Charset": "UTF-8"},
-                        "Body": {"Text": {"Data": email_body, "Charset": "UTF-8"}}
-                    }
-                )
-                logger.info("✅ Email sent! Message ID: %s", resp["MessageId"])
-                email_sent = True
-            except Exception as e:
-                logger.error(f"❌ Failed to send email: {e}")
+            if dry_run_email:
+                logger.info("🧪 DRY_RUN_EMAIL=true — skipping SES send. Email body below:\n" + email_body)
+            else:
+                try:
+                    logger.info("📧 Sending email via SES...")
+                    ses = boto3.client("ses", region_name=aws_region)
+                    resp = ses.send_email(
+                        Source=email_from,
+                        Destination={"ToAddresses": [email_to]},
+                        Message={
+                            "Subject": {"Data": email_subject, "Charset": "UTF-8"},
+                            "Body": {"Text": {"Data": email_body, "Charset": "UTF-8"}}
+                        }
+                    )
+                    logger.info("✅ Email sent! Message ID: %s", resp["MessageId"])
+                    email_sent = True
+                except Exception as e:
+                    logger.error(f"❌ Failed to send email: {e}")
 
-    # ---- Audit summary (always) ----
+    # ---- Audit summary (always)
     summary = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "physician_id": physician_ids_raw,
         "date_start": start_date.strftime("%Y-%m-%d"),
         "date_end": end_date.strftime("%Y-%m-%d"),
-        "total_notes": int(len(df_filtered)),
-        "high_risk_count": int(len(df_email)),
+        "total_notes": int(total_rows),
+        "high_risk_count": int(total_high_risk),
         "email_sent": email_sent,
         "output_path": f"s3://{output_bucket}/{output_key}",
         "run_duration_sec": round(time.time() - start_time, 2),
@@ -634,7 +546,6 @@ Your Clinical Risk Bot
     audit_bucket = os.getenv("AUDIT_BUCKET", output_bucket)
     audit_prefix = os.getenv("AUDIT_PREFIX", "audit_logs")
     audit_key = f"{audit_prefix}/{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')}_summary.json"
-
     log_audit_summary(s3, audit_bucket, audit_key, summary)
     logger.info(f"📁 Audit log written to s3://{audit_bucket}/{audit_key}")
     logger.info("📊 Run Summary:\n" + json.dumps(summary, indent=2))

@@ -1,142 +1,175 @@
-# 🧠 Patient Risk Assessment Pipeline
+🧠 Agentic AI Patient Risk Pipeline
 
-## 📌 Overview
-This project runs a fully containerized **clinical note analysis pipeline** on AWS ECS Fargate.
+📌 Overview
 
-- **Input:** Patient notes from S3 (`s3://<bucket>/Input/`)
-- **Processing (ECS Fargate):**
-  - Reads notes from S3
-  - Retrieves the OpenAI API key from AWS Secrets Manager (or env fallback)
-  - Calls OpenAI API to assess patient risk and generate follow-up recommendations
-  - Writes annotated CSV back to S3 (`Output/`)
-  - Sends an SES email summary listing high-risk patients
-- **Security:**
-  - **Execution Role** — allows ECS to pull images, write logs, and retrieve secrets  
-  - **Task Role** — scoped for S3 read/write, SES email sending, and optional secret fetches
+This project implements a fully containerized agentic AI workflow for analyzing clinical notes.
+It runs on AWS ECS Fargate and uses OpenAI’s GPT models to surface high-risk patients and generate actionable summaries for clinicians.
 
----
+Input: CSV patient notes in S3 (s3://<bucket>/Input/)
 
-## 🏗 Architecture
+Processing:
+
+Retrieve OpenAI API key securely from AWS Secrets Manager
+
+Sequentially apply LLM prompts + regex/NLP parsing + risk scoring
+
+Append results to the input CSV and save to S3 Output/
+
+Send a summary email to clinicians via SES
+
+Output:
+
+Annotated CSVs in S3 (s3://<bucket>/Output/)
+
+Audit logs in S3 (s3://<bucket>/Audit/)
+
+SES email listing high-risk patients
+
+⚠️ Clinical disclaimer: This pipeline does not replace clinicians. All flagged cases must be manually reviewed by qualified professionals before action is taken.
 
 
-S3 (Input CSVs) ──► ECS Fargate Task ──► S3 (Output CSVs)  
-│  
-├──► OpenAI (risk scoring + recommendations)  
-└──► SES (summary email)
+🏗 Architecture
 
----
+S3 (Input CSVs) ──► ECS Fargate Task ──► S3 (Output CSVs)
+ │
+ ├──► OpenAI GPT (risk scoring + recommendations)
+ └──► SES (summary email to clinicians)
 
-## 📂 Repo Structure
+Key principles:
 
-```text
-src/                    # Application logic
-    patient_risk_pipeline.py    # main pipeline (CLI + ECS entrypoint)
+Human-in-the-loop: clinicians review all outputs
 
-fargate_deployment/     # Deployment automation
-    scripts/            # Shell deployment helpers
-        build_and_push.sh      # Build + push Docker image
-        deploy_to_fargate.sh   # Register & run task definition
-        run_all.sh             # Full one-shot deployment
-        run_local.sh           # Local dry-run (no SES, throttleable)
-        fetch_artifacts.sh     # Pull latest output & audit logs from S3
-        seed_sample_input.sh   # Uploads a toy CSV input to S3
-        setup_iam.sh           # Creates/attaches IAM roles & policies
-        teardown_all.sh        # Clean up roles/resources
-        validate_config.sh     # Sanity check config.env
-    policies/           # IAM trust & access JSON policies
-    templates/          # ECS task definition templates
+Security: Secrets Manager for API keys, least-privilege IAM roles
 
-config.env.example       # Sample environment configuration  
-requirements.txt         # Python + pytest dependencies  
-Dockerfile               # Container build file  
-pytest.ini               # Pytest settings  
-test/                    # Unit tests (risk extraction, parsing, schema merge)
+Traceability: logs + outputs stored in S3
 
-```
 
-## 🚀 Quick Start
+🧾 Prompt Design (RISEN Framework)
 
-The easiest way to deploy is with the one-shot runner:
+Prompt engineering followed the RISEN framework (Role, Input, Steps, Expectation, Narrowing):
 
-```bash
-# 1. Configure
+Role: instruct GPT to act as a primary care physician
+
+Input: provide raw unstructured clinical notes
+
+Steps: risk scoring, explanation, follow-up recommendation prompts
+
+Expectation: consistent numeric risk scores (1–100) + concise justifications
+
+Narrowing: follow-up prompts only triggered for high-risk cases
+
+Example initial risk-assessment prompt:
+
+Please assume the role of a primary care physician.  
+Based on the following patient summary text, provide a single risk rating between 1 and 100 
+for the patient's need for follow-up care within the next year, 
+with 1 being nearly no risk and 100 being the greatest risk.  
+
+Respond in the following format:
+
+Risk Score: <numeric_value>
+<Brief explanation or justification here (optional)>
+
+Here is the patient summary:
+<NOTE_TEXT>
+
+Subsequent prompts summarize top medical concerns and generate specialty-specific follow-up recommendations.
+
+
+📂 Repo Structure
+
+src/                        # Core pipeline logic
+    patient_risk_pipeline.py   # Main entrypoint (CLI + ECS)
+
+fargate_deployment/         # Deployment automation
+    scripts/                # Shell helpers
+        build_and_push.sh       # Build + push Docker image
+        deploy_to_fargate.sh    # Register & run task definition
+        run_all.sh              # One-shot deploy + execute
+        run_local.sh            # Local dry-run (LLM_DISABLED, DRY_RUN_EMAIL)
+        fetch_artifacts.sh      # Download outputs from S3
+        seed_sample_input.sh    # Upload sample CSV
+        setup_iam.sh            # Create IAM roles & policies
+        teardown_all.sh         # Cleanup IAM + resources
+        validate_config.sh      # Sanity-check config.env
+    templates/                 # ECS task definition JSONs
+
+config.env.example           # Editable runtime configuration
+requirements.txt             # Python + test deps
+Dockerfile                   # Container build
+pytest.ini                   # Pytest config
+test/                        # Unit tests
+
+
+🚀 Quick Start
+
+# 1. Configure environment
 cp config.env.example config.env
-# edit config.env with your AWS_ACCOUNT_ID, region, S3 paths, SES emails, etc.
+# Edit with AWS account, region, S3 paths, SES emails, etc.
 
-# 2. Deploy end-to-end
+# 2. Deploy + run end-to-end
 cd fargate_deployment/scripts
 ./run_all.sh
 
-```
 
-After this completes:
+Results:
 
-    ✅ Processed CSV is written to your S3 Output path
+✅ Output CSV written to your S3 Output/ path
 
-    ✅ Email notification is sent via SES
+✅ Email notification sent via SES
 
-    ✅ Audit JSON summary is stored in s3://<AUDIT_BUCKET>/<AUDIT_PREFIX>/
+✅ Audit JSON stored in Audit/ S3 prefix
 
+⏱ Scheduling
 
-🛠 Useful Scripts
-- `setup_iam.sh` — one-time IAM role/policy bootstrap  
-- `build_and_push.sh` — build & push Docker image  
-- `deploy_to_fargate.sh` — register & run ECS task (with Secrets Manager injection)  
-- `run_local.sh` — local smoke test (supports LLM_DISABLED=true, DRY_RUN_EMAIL=true, MAX_NOTES=5)  
-- `fetch_artifacts.sh` — download latest output CSV + audit JSON locally  
-- `seed_sample_input.sh` — upload toy CSV so you can demo pipeline quickly  
-- `teardown_all.sh` — remove IAM roles/policies when cleaning up  
+The pipeline can be automated with EventBridge:
 
+Example: run weekly to scan the last 7 days of notes
 
-## ⚙️ Runtime Configuration (env vars)
+Custom: run on demand for specific clinician IDs, time windows, or thresholds
 
-| Variable        | Purpose                                           | Example |
-|-----------------|---------------------------------------------------|---------|
-| `INPUT_S3`      | Input CSV path in S3                              | `s3://my-bucket/Input/notes.csv` |
-| `OUTPUT_S3`     | Output CSV path in S3                             | `s3://my-bucket/Output/results.csv` |
-| `EMAIL_FROM`    | SES-verified sender email                         | `alerts@mydomain.com` |
-| `EMAIL_TO`      | Recipient email                                   | `team@mydomain.com` |
-| `THRESHOLD`     | Risk score cutoff (0–1.0)                         | `0.95` |
-| `LLM_DISABLED`  | Skip OpenAI API, return stub responses (fast test) | `true` |
-| `DRY_RUN_EMAIL` | Don’t send SES email, just log body               | `true` |
-| `MAX_NOTES`     | Cap number of notes processed (for testing)       | `5` |
-| `RUN_ID`        | Unique run identifier (auto-set if not provided)  | `2025-08-24T12:00:00Z` |
-| `LOG_FORMAT`    | `json` (default) or `text`                        | `text` |
-| `LOG_LEVEL`     | Logging verbosity                                 | `DEBUG` |
+⚙️ Runtime Configuration
 
+| Variable        | Purpose                                       | Example                          |
+| --------------- | --------------------------------------------- | -------------------------------- |
+| `INPUT_S3`      | Input CSV in S3                               | `s3://bucket/Input/notes.csv`    |
+| `OUTPUT_S3`     | Output CSV in S3                              | `s3://bucket/Output/results.csv` |
+| `EMAIL_FROM`    | SES-verified sender email                     | `alerts@mydomain.com`            |
+| `EMAIL_TO`      | Recipient email                               | `team@mydomain.com`              |
+| `THRESHOLD`     | Risk cutoff (0–1.0)                           | `0.95`                           |
+| `LLM_DISABLED`  | Stub responses, skip OpenAI                   | `true`                           |
+| `DRY_RUN_EMAIL` | Log email body but don’t send                 | `true`                           |
+| `MAX_NOTES`     | Cap # of notes processed (testing)            | `5`                              |
+| `RUN_ID`        | Unique identifier (auto-generated if missing) | `2025-08-24T12:00:00Z`           |
+| `LOG_FORMAT`    | `json` (default) or `text`                    | `text`                           |
+| `LOG_LEVEL`     | Logging verbosity                             | `DEBUG`                          |
 
 
 🧪 Testing
 
-This repo includes lightweight unit tests (no AWS calls):
+Run local unit tests (no AWS calls):
 
 pip install -r requirements.txt
 pytest
 
-Covers:
-
-    Risk score extraction
-
-    Parsing of model responses
-
-    Schema merge logic
 
 🔒 Security Notes
 
-    No secrets are committed — OpenAI API key lives in AWS Secrets Manager.
+Secrets: API keys stored in AWS Secrets Manager, not committed.
 
-    IAM roles follow least privilege principle.
+IAM: Execution role (ECR/logs/secrets) vs Task role (S3/SES/Secrets).
 
-    .gitignore ensures sensitive files (like config.env) are not committed.
+SES Sandbox: requires verifying EMAIL_FROM and EMAIL_TO.
 
-    SES sandbox requires verifying both EMAIL_FROM and EMAIL_TO addresses.
+.gitignore: prevents leaking config/env secrets.
+
 
 🎉 Demo Workflow
 
 # One-time IAM setup
 ./fargate_deployment/scripts/setup_iam.sh
 
-# Upload toy input CSV
+# Upload toy CSV
 ./fargate_deployment/scripts/seed_sample_input.sh
 
 # Run full pipeline
@@ -145,4 +178,18 @@ Covers:
 # Fetch outputs locally
 ./fargate_deployment/scripts/fetch_artifacts.sh
 
-Artifacts will be in /tmp/patient-pipeline-artifacts/ and your SES inbox.
+Artifacts appear in /tmp/patient-pipeline-artifacts/ and your SES inbox.
+
+
+📊 Future Directions
+
+Interactive review portal (web UI)
+
+Fine-tuned clinical LLMs
+
+Multi-modal input (labs, imaging, notes)
+
+© 2025 Timothy Waterman • Hosted project website
+
+Github:
+https://github.com/timfwater/patients-pipeline

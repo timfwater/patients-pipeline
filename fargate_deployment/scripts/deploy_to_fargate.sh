@@ -5,6 +5,15 @@ set -euo pipefail
 : "${DEBUG:=false}"
 $DEBUG && set -x
 
+# ========= Writable FS knob (fixes /tmp writes) =========
+# Set to true only if your code does NOT write to local FS.
+: "${READONLY_FS:=false}"
+# Bash 3.2-compatible truthy check (no ${var,,})
+case "${READONLY_FS}" in
+  true|TRUE|True|t|T|1|yes|YES|Yes) ROFS_JSON=true ;;
+  *) ROFS_JSON=false ;;
+esac
+
 # ========= Locate & load config =========
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -202,6 +211,7 @@ jq \
   --arg logRegion "$AWS_REGION" \
   --argjson env  "$ENV_JSON" \
   --argjson secrets "$SECRETS_JSON" \
+  --argjson rofs "$ROFS_JSON" \
   '
   .family=$family
   | .executionRoleArn=$execRole
@@ -213,6 +223,7 @@ jq \
   | .containerDefinitions[0].logConfiguration.options["awslogs-group"]=$logGroup
   | .containerDefinitions[0].logConfiguration.options["awslogs-stream-prefix"]=$logPrefix
   | .containerDefinitions[0].logConfiguration.options["awslogs-region"]=$logRegion
+  | .containerDefinitions[0].readonlyRootFilesystem=$rofs
   ' \
   "$TEMPLATE" > "$FINAL_TD"
 
@@ -252,6 +263,7 @@ fi
 
 echo "NETCFG: subnets=[$SUBNET_IDS] sg=[$SECURITY_GROUP_ID] assignPublicIp=[$ASSIGN_PUBLIC_IP]"
 echo "ROLES: exec=$RESOLVED_EXEC_ROLE_ARN task=$RESOLVED_TASK_ROLE_ARN logGroup=$LOG_GROUP"
+echo "FS: readonlyRootFilesystem=${ROFS_JSON}"
 
 # ========= Run one-off task =========
 echo "🚀 Running task (assignPublicIp=${ASSIGN_PUBLIC_IP})"
