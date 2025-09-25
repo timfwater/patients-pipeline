@@ -84,7 +84,7 @@ config.env.example           # Editable runtime configuration
 requirements.txt             # Python + test deps
 Dockerfile                   # Container build
 pytest.ini                   # Pytest config
-test/                        # Unit tests```
+test/                        # Unit tests
 
 
 🚀 **Quick Start**
