@@ -173,5 +173,5 @@ Multi-modal input (labs, imaging, notes)
 
 © 2025 Timothy Waterman • Hosted project website
 
-**Github:**
-https://github.com/timfwater/patients-pipeline
+**Project Walkthrough:**
+https://wbst-bkt.s3.us-east-1.amazonaws.com/patient_index.html
