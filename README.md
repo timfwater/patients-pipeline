@@ -113,7 +113,7 @@ Example: run weekly to scan the last 7 days of notes
 
 Custom: run on demand for specific clinician IDs, time windows, or thresholds
 
-⚙️ Runtime Configuration
+⚙️ **Runtime Configuration**
 
 | Variable        | Purpose                                       | Example                          |
 | --------------- | --------------------------------------------- | -------------------------------- |
