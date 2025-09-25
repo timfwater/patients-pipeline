@@ -169,11 +169,8 @@ SES Sandbox: requires verifying EMAIL_FROM and EMAIL_TO.
 # One-time IAM setup
 ./fargate_deployment/scripts/setup_iam.sh
 
-# Upload toy CSV
-./fargate_deployment/scripts/seed_sample_input.sh
-
 # Run full pipeline
-./fargate_deployment/scripts/run_all.sh
+./fargate_deployment/scripts/deploy_to_fargate.sh
 
 # Fetch outputs locally
 ./fargate_deployment/scripts/fetch_artifacts.sh
