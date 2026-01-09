@@ -116,6 +116,12 @@ fi
 : "${MAX_NOTES:=0}"
 : "${LOG_FORMAT:=json}"              # "json" (default) or "text"
 : "${LOG_LEVEL:=INFO}"
+: "${RAG_ENABLED:=false}"
+: "${RAG_KB_PATH:=}"
+: "${RAG_TOP_K:=4}"
+: "${RAG_MAX_CHARS:=2500}"
+: "${RAG_AUDIT_MAX_CHARS:=1200}"
+
 
 # ========= Secrets (OpenAI) handling =========
 SECRETS_JSON='[]'
@@ -166,29 +172,42 @@ ENV_JSON="$(jq -n \
   --arg MAX_NOTES         "$MAX_NOTES" \
   --arg LOG_FORMAT        "$LOG_FORMAT" \
   --arg LOG_LEVEL         "$LOG_LEVEL" \
+  --arg RAG_ENABLED       "$RAG_ENABLED" \
+  --arg RAG_KB_PATH       "$RAG_KB_PATH" \
+  --arg RAG_TOP_K         "$RAG_TOP_K" \
+  --arg RAG_MAX_CHARS     "$RAG_MAX_CHARS" \
+  --arg RAG_AUDIT_MAX_CHARS "$RAG_AUDIT_MAX_CHARS" \
   '
   [
-    {name:"AWS_REGION",        value:$AWS_REGION},
-    {name:"INPUT_S3",          value:$INPUT_S3},
-    {name:"OUTPUT_S3",         value:$OUTPUT_S3},
-    {name:"PHYSICIAN_ID_LIST", value:$PHYSICIAN_ID_LIST},
-    {name:"THRESHOLD",         value:$THRESHOLD},
-    {name:"START_DATE",        value:$START_DATE},
-    {name:"END_DATE",          value:$END_DATE},
-    {name:"EMAIL_FROM",        value:$EMAIL_FROM},
-    {name:"EMAIL_TO",          value:$EMAIL_TO},
-    {name:"EMAIL_SUBJECT",     value:$EMAIL_SUBJECT},
-    {name:"OPENAI_MODEL",      value:$OPENAI_MODEL},
-    {name:"OPENAI_THROTTLE_SEC", value:$OPENAI_THROTTLE},
-    {name:"AUDIT_BUCKET",      value:$AUDIT_BUCKET},
-    {name:"AUDIT_PREFIX",      value:$AUDIT_PREFIX},
-    {name:"RUN_ID",            value:$RUN_ID},
-    {name:"LLM_DISABLED",      value:$LLM_DISABLED},
-    {name:"DRY_RUN_EMAIL",     value:$DRY_RUN_EMAIL},
-    {name:"MAX_NOTES",         value:$MAX_NOTES},
-    {name:"LOG_FORMAT",        value:$LOG_FORMAT},
-    {name:"LOG_LEVEL",         value:$LOG_LEVEL}
-  ]')"
+    {name:"AWS_REGION",           value:$AWS_REGION},
+    {name:"INPUT_S3",             value:$INPUT_S3},
+    {name:"OUTPUT_S3",            value:$OUTPUT_S3},
+    {name:"PHYSICIAN_ID_LIST",    value:$PHYSICIAN_ID_LIST},
+    {name:"THRESHOLD",            value:$THRESHOLD},
+    {name:"START_DATE",           value:$START_DATE},
+    {name:"END_DATE",             value:$END_DATE},
+    {name:"EMAIL_FROM",           value:$EMAIL_FROM},
+    {name:"EMAIL_TO",             value:$EMAIL_TO},
+    {name:"EMAIL_SUBJECT",        value:$EMAIL_SUBJECT},
+    {name:"OPENAI_MODEL",         value:$OPENAI_MODEL},
+    {name:"OPENAI_THROTTLE_SEC",  value:$OPENAI_THROTTLE},
+    {name:"AUDIT_BUCKET",         value:$AUDIT_BUCKET},
+    {name:"AUDIT_PREFIX",         value:$AUDIT_PREFIX},
+    {name:"RUN_ID",               value:$RUN_ID},
+    {name:"LLM_DISABLED",         value:$LLM_DISABLED},
+    {name:"DRY_RUN_EMAIL",        value:$DRY_RUN_EMAIL},
+    {name:"MAX_NOTES",            value:$MAX_NOTES},
+    {name:"LOG_FORMAT",           value:$LOG_FORMAT},
+    {name:"LOG_LEVEL",            value:$LOG_LEVEL},
+
+    {name:"RAG_ENABLED",          value:$RAG_ENABLED},
+    {name:"RAG_KB_PATH",          value:$RAG_KB_PATH},
+    {name:"RAG_TOP_K",            value:$RAG_TOP_K},
+    {name:"RAG_MAX_CHARS",        value:$RAG_MAX_CHARS},
+    {name:"RAG_AUDIT_MAX_CHARS",  value:$RAG_AUDIT_MAX_CHARS}
+  ]
+')"
+
 
 # If using plaintext API key, append it to env
 if [[ -n "${OPENAI_API_KEY:-}" ]]; then

@@ -16,7 +16,7 @@
       "name": "patient-pipeline",
       "image": "REPLACE_IMAGE_URI",
       "essential": true,
-      "readonlyRootFilesystem": true,
+      "readonlyRootFilesystem": false,
       "stopTimeout": 60,
       "logConfiguration": {
         "logDriver": "awslogs",
@@ -58,7 +58,12 @@
         { "name": "MAX_NOTES", "value": "REPLACE_MAX_NOTES" },
 
         { "name": "LOG_GROUP", "value": "REPLACE_LOG_GROUP" },
-        { "name": "LOG_STREAM_PREFIX", "value": "REPLACE_LOG_STREAM_PREFIX" }
+        { "name": "LOG_STREAM_PREFIX", "value": "REPLACE_LOG_STREAM_PREFIX" },
+
+        { "name": "RAG_ENABLED", "value": "REPLACE_RAG_ENABLED" },
+        { "name": "RAG_KB_PATH", "value": "REPLACE_RAG_KB_PATH" },
+        { "name": "RAG_TOP_K", "value": "REPLACE_RAG_TOP_K" },
+        { "name": "RAG_MAX_CHARS", "value": "REPLACE_RAG_MAX_CHARS" }
       ],
       "command": [
         "python",
