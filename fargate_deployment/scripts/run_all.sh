@@ -84,14 +84,18 @@ fi
 : "${FARGATE_SECURITY_GROUP_IDS:?Missing FARGATE_SECURITY_GROUP_IDS in config.env}"
 green "✅ Preflight OK."
 
-# ------------- smart IMAGE_TAG -------------
+# ------------- smart IMAGE_TAG (Option A: always-unique) -------------
 if [[ -z "${IMAGE_TAG:-}" ]]; then
+  TS="$(date +%Y%m%d-%H%M%S)"
   if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    IMAGE_TAG="$(git -C "$ROOT_DIR" rev-parse --short HEAD)"
+    SHA="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo nogit)"
+    DIRTY=""
+    if ! git -C "$ROOT_DIR" diff --quiet >/dev/null 2>&1 || ! git -C "$ROOT_DIR" diff --cached --quiet >/dev/null 2>&1; then
+      DIRTY="-dirty"
+    fi
+    IMAGE_TAG="${TS}-${SHA}${DIRTY}"
   else
-    HASH=$( (cd "$ROOT_DIR" && { cat Dockerfile 2>/dev/null || true; cat requirements.txt 2>/dev/null || true; find src -type f -print0 2>/dev/null | sort -z | xargs -0 cat 2>/dev/null || true; } | shasum | awk '{print $1}') )
-    TS=$(date +%Y%m%d-%H%M%S)
-    IMAGE_TAG="${TS}-${HASH:0:8}"
+    IMAGE_TAG="${TS}-nogit"
   fi
 fi
 export IMAGE_TAG

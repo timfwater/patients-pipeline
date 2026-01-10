@@ -12,7 +12,13 @@ from io import TextIOWrapper
 import boto3
 import pandas as pd
 import requests
-import openai
+from openai import OpenAI
+from openai import (
+    APIError,
+    APIConnectionError,
+    APITimeoutError,
+    RateLimitError,
+)
 
 from src.rag_tfidf import (
     build_index_from_env,
@@ -31,6 +37,13 @@ OUTPUT_TMP = os.getenv("OUTPUT_TMP", "/tmp/output.csv")    # local rolling outpu
 
 # If true, prefer pandas+s3fs path reading; otherwise stream via boto3 (safer in containers)
 USE_S3FS = os.getenv("USE_S3FS", "false").lower() == "true"
+
+# LangChain wedge toggle (safe default: off)
+USE_LANGCHAIN = os.getenv("USE_LANGCHAIN", "false").lower() == "true"
+# Shared OpenAI runtime knobs (used by both direct OpenAI + LangChain wedge)
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0") or 0)
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "800") or 800)
+OPENAI_TIMEOUT_SEC = int(os.getenv("OPENAI_TIMEOUT_SEC", "60") or 60)
 
 # =========
 # Logging
@@ -76,16 +89,56 @@ try:
 except Exception as e:
     # If RAG is disabled, build_index_from_env() returns None.
     # If enabled but misconfigured, this warning tells you why.
-    logger.warning(f"RAG unavailable: {e}")
+    logger.warning("RAG unavailable: %s", e)
     RAG_INDEX = None
+
+# --- RAG startup diagnostics (helps you confirm ON/OFF immediately) ---
+logger.info("🧠 RAG_INDEX loaded: %s", "YES" if RAG_INDEX is not None else "NO")
+logger.info("🧠 RAG_ENABLED=%s", os.getenv("RAG_ENABLED", "unset"))
+logger.info("🧠 RAG_KB_PATH=%s", os.getenv("RAG_KB_PATH", "unset"))
+logger.info("🧠 RAG_TOP_K=%s", os.getenv("RAG_TOP_K", "unset"))
+logger.info("🧠 RAG_MAX_CHARS=%s", os.getenv("RAG_MAX_CHARS", "unset"))
 
 # =========================
 # OpenAI API key resolution
 # =========================
+def _extract_openai_key_from_secret_string(secret_string: str) -> str:
+    """
+    Supports secrets stored as either:
+      - plain text API key
+      - JSON blob with common key names (e.g., {"OPENAI_API_KEY":"..."}).
+    """
+    if not secret_string:
+        return secret_string
+
+    s = secret_string.strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        return s
+
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            for k in [
+                "OPENAI_API_KEY",
+                "openai_api_key",
+                "api_key",
+                "OPENAI_KEY",
+                "openaiKey",
+                "key",
+            ]:
+                v = obj.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    except Exception:
+        pass
+
+    # If it looked like JSON but we couldn't extract a field, return raw string
+    return s
+
 def _get_openai_key_from_secrets(secret_name: str, region_name: str) -> str:
     client = boto3.client("secretsmanager", region_name=region_name)
     resp = client.get_secret_value(SecretId=secret_name)
-    return resp["SecretString"]
+    return _extract_openai_key_from_secret_string(resp.get("SecretString", "") or "")
 
 def get_openai_key() -> str:
     """
@@ -93,8 +146,8 @@ def get_openai_key() -> str:
     AWS Secrets Manager using OPENAI_API_KEY_SECRET_NAME or OPENAI_SECRET_NAME.
     """
     key = os.getenv("OPENAI_API_KEY")
-    if key:
-        return key
+    if key and key.strip():
+        return key.strip()
 
     secret_name = (
         os.getenv("OPENAI_API_KEY_SECRET_NAME")
@@ -111,13 +164,15 @@ def get_openai_key() -> str:
             f"(secret='{secret_name}', region='{region}'): {e}"
         )
 
-# Initialize OpenAI (unless disabled)
+# Initialize OpenAI client (unless disabled)
+OPENAI_CLIENT: OpenAI | None = None
 if not LLM_DISABLED:
-    openai.api_key = get_openai_key()
+    OPENAI_CLIENT = OpenAI(api_key=get_openai_key())
 
 logger.info("✅ SCRIPT IS RUNNING")
 logger.info("📡 ECS log stream: %s", os.getenv("LOG_STREAM", "unknown"))
 logger.info("🆔 ECS task ID: %s", os.getenv("TASK_ID", "unknown"))
+logger.info("🧩 USE_LANGCHAIN=%s", USE_LANGCHAIN)
 
 # ========
 # Prompts
@@ -205,12 +260,29 @@ def extract_risk_score(text):
     return None
 
 # --- Robust OpenAI caller with backoff + jitter + optional throttle ---
-def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.5, max_delay=20):
+def get_chat_response(
+    inquiry_note,
+    model=OPENAI_MODEL,
+    retries=8,
+    base_delay=1.5,
+    max_delay=20,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    timeout_sec: int | None = None,
+):
     """
-    Calls OpenAI ChatCompletion with exponential backoff and jitter.
-    Respects GLOBAL_THROTTLE (seconds) between calls if set via env OPENAI_THROTTLE_SEC.
+    Calls OpenAI Chat Completions (OpenAI Python SDK v1.x) with exponential backoff and jitter.
+    Respects GLOBAL_THROTTLE between calls if set via env OPENAI_THROTTLE_SEC.
+    Uses shared knobs (temperature/max_tokens/timeout) unless explicitly overridden.
     If LLM_DISABLED=true, returns a deterministic stub.
     """
+    if temperature is None:
+        temperature = OPENAI_TEMPERATURE
+    if max_tokens is None:
+        max_tokens = OPENAI_MAX_TOKENS
+    if timeout_sec is None:
+        timeout_sec = OPENAI_TIMEOUT_SEC
+
     if LLM_DISABLED:
         if inquiry_note.strip().startswith("Please assume the role"):
             return {"message": {"content": "Risk Score: 72\nLikely follow-up needed."}}
@@ -223,18 +295,37 @@ def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.
             "1. Hypertension\n2. A1c elevation\n3. Chest pain\n4. Medication adherence\n5. BMI"
         )}}
 
+    if OPENAI_CLIENT is None:
+        raise RuntimeError("OPENAI_CLIENT not initialized (check LLM_DISABLED and OPENAI_API_KEY injection).")
+
     last_err = None
     for attempt in range(retries):
         try:
             if GLOBAL_THROTTLE > 0:
                 time.sleep(GLOBAL_THROTTLE)
 
-            resp = openai.ChatCompletion.create(
+            resp = OPENAI_CLIENT.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": inquiry_note}],
-                timeout=60,
+                messages=[{"role": "user", "content": str(inquiry_note)}],
+                temperature=float(temperature),
+                max_tokens=int(max_tokens),
+                timeout=float(timeout_sec),
             )
-            return {"message": {"content": resp.choices[0].message.content}}
+
+            content = ""
+            try:
+                content = resp.choices[0].message.content or ""
+            except Exception:
+                content = ""
+
+            return {"message": {"content": content}}
+
+        except (RateLimitError, APITimeoutError, APIConnectionError, APIError) as e:
+            last_err = e
+            sleep_s = min(max_delay, base_delay * (2 ** attempt)) * (0.5 + random.random())
+            logger.warning("OpenAI transient error on attempt %d: %s. Backing off %.1fs...", attempt + 1, e, sleep_s)
+            time.sleep(sleep_s)
+
         except Exception as e:
             last_err = e
             msg = str(e).lower()
@@ -282,14 +373,65 @@ def _read_csv_s3_in_chunks(s3_client, s3_uri: str, chunksize: int, aws_region: s
     text_stream = TextIOWrapper(obj["Body"], encoding="utf-8")
     return pd.read_csv(text_stream, chunksize=chunksize)
 
+# -----------------------------
+# LangChain wedge (optional)
+# -----------------------------
+def _risk_rating_via_langchain(note_text: str) -> tuple[str, str | None]:
+    """
+    Returns (risk_rating_text, optional_rationale_text).
+
+    risk_rating_text is formatted to match your existing downstream parser:
+      "Risk Score: <1-100>\n..."
+
+    rationale_text is optional (nice-to-have for portfolio); safe to ignore.
+    """
+    if LLM_DISABLED:
+        return "Risk Score: 72\nLikely follow-up needed.", "Likely follow-up needed."
+
+    try:
+        from src.llm_chain import assess_note_with_langchain  # type: ignore
+    except Exception as e:
+        logger.warning("USE_LANGCHAIN=true but src.llm_chain import failed (%s). Falling back to OpenAI path.", e)
+        return get_chat_response(RISK_PROMPT + str(note_text))["message"]["content"], None
+
+    try:
+        try:
+            assessment = assess_note_with_langchain(
+                note_text=str(note_text),
+                rag_context="",
+                model=OPENAI_MODEL,
+                temperature=OPENAI_TEMPERATURE,
+                max_tokens=OPENAI_MAX_TOKENS,
+                timeout_sec=OPENAI_TIMEOUT_SEC,
+            )
+        except TypeError:
+            assessment = assess_note_with_langchain(note_text=str(note_text), rag_context="")
+
+        score_0_1 = float(assessment.risk_score)
+        score_1_100 = max(1, min(100, int(round(score_0_1 * 100))))
+
+        rationale = ""
+        try:
+            if getattr(assessment, "rationale_bullets", None):
+                rationale = "\n".join(f"- {b}" for b in assessment.rationale_bullets if str(b).strip())
+        except Exception:
+            rationale = ""
+
+        risk_text = f"Risk Score: {score_1_100}"
+        if rationale:
+            risk_text += f"\n{rationale}"
+
+        return risk_text, (rationale if rationale else None)
+    except Exception as e:
+        logger.warning("LangChain assessment failed (%s). Falling back to OpenAI path.", e)
+        return get_chat_response(RISK_PROMPT + str(note_text))["message"]["content"], None
+
 def query_combined_prompt(note, template=COMBINED_PROMPT):
     note_text = str(note)
 
-    # capture what RAG injected (for auditing)
     rag_audit_text = None
     audit_max = int(os.getenv("RAG_AUDIT_MAX_CHARS", "1200"))
 
-    # --- RAG injection (optional, gated by config) ---
     if RAG_INDEX is not None:
         try:
             top_k = int(os.getenv("RAG_TOP_K", "4"))
@@ -297,7 +439,6 @@ def query_combined_prompt(note, template=COMBINED_PROMPT):
 
             snips = retrieve_kb(note_text, RAG_INDEX, top_k=top_k)
 
-            # Compute diagnostics (safe even if schema varies)
             best_sim = None
             titles_str = ""
             kb_ids_str = ""
@@ -389,7 +530,10 @@ def parse_response_and_concerns(text):
         )
     except Exception as e:
         logger.warning(f"Failed to parse response (len={len(str(text)) if text is not None else 0}): {e}")
-        return pd.Series([None] * 5, index=["follow_up_1mo", "follow_up_6mo", "oncology_rec", "cardiology_rec", "top_concerns"])
+        return pd.Series(
+            [None] * 5,
+            index=["follow_up_1mo", "follow_up_6mo", "oncology_rec", "cardiology_rec", "top_concerns"],
+        )
 
 def log_audit_summary(s3_client, bucket, key, summary, retries=3):
     payload = json.dumps(summary, indent=2).encode("utf-8")
@@ -488,7 +632,8 @@ def run_pipeline(
                     "combined_response", "rag_context",
                     "follow_up_1mo", "follow_up_6mo",
                     "oncology_rec", "cardiology_rec",
-                    "top_concerns"
+                    "top_concerns",
+                    "lc_rationale",
                 ]:
                     if c not in df_final.columns:
                         df_final[c] = None
@@ -536,6 +681,7 @@ def run_pipeline(
             "oncology_rec",
             "cardiology_rec",
             "top_concerns",
+            "lc_rationale",
         ]:
             if col not in df.columns:
                 df[col] = None
@@ -552,11 +698,22 @@ def run_pipeline(
         if remaining_to_score < len(df_to_score):
             df_to_score = df_to_score.head(int(remaining_to_score))
 
-        # ---- Risk scoring
-        logger.info("🧪 Chunk %d: scoring %d notes (budget remaining before: %s)", chunk_idx, len(df_to_score), remaining_to_score)
-        df_to_score["risk_rating"] = df_to_score["full_note"].apply(
-            lambda note: get_chat_response(RISK_PROMPT + str(note))["message"]["content"]
+        logger.info(
+            "🧪 Chunk %d: scoring %d notes (budget remaining before: %s)",
+            chunk_idx, len(df_to_score), remaining_to_score
         )
+
+        if USE_LANGCHAIN:
+            scored = df_to_score["full_note"].apply(lambda note: pd.Series(
+                _risk_rating_via_langchain(str(note)),
+                index=["risk_rating", "lc_rationale"]
+            ))
+            df_to_score.loc[scored.index, ["risk_rating", "lc_rationale"]] = scored
+        else:
+            df_to_score["risk_rating"] = df_to_score["full_note"].apply(
+                lambda note: get_chat_response(RISK_PROMPT + str(note))["message"]["content"]
+            )
+
         df_to_score["risk_score"] = df_to_score["risk_rating"].apply(extract_risk_score)
         remaining_to_score -= len(df_to_score)
 
@@ -628,17 +785,88 @@ def run_pipeline(
                 sections.append(section)
 
         if sections:
-            email_body = f"""
+            patient_summaries = "\n".join(sections).strip()
+
+            # ==========================================================
+            # ✅ INSERTED UPDATE: guardrail truncation for LangChain email
+            # ==========================================================
+            max_email_chars = int(os.getenv("EMAIL_LLM_MAX_CHARS", "12000"))
+            if len(patient_summaries) > max_email_chars:
+                logger.warning(
+                    "📎 patient_summaries is %d chars; truncating to %d for email drafting.",
+                    len(patient_summaries), max_email_chars
+                )
+                patient_summaries = patient_summaries[:max_email_chars] + "\n\n[TRUNCATED]"
+            # ==========================================================
+            # ✅ END INSERTED UPDATE
+            # ==========================================================
+
+            # Option A: Use LangChain to draft a clinician-friendly email from deterministic sections.
+            # This gives you a clear 2nd LangChain-driven LLM call (portfolio signal) while keeping
+            # the "facts" deterministic (reduces hallucination risk).
+            if USE_LANGCHAIN:
+                try:
+                    from src.llm_chain import draft_clinician_email_with_langchain  # type: ignore
+
+                    clinic_context = os.getenv("CLINIC_CONTEXT", "").strip()
+
+                    drafted = draft_clinician_email_with_langchain(
+                        patient_summaries=patient_summaries,
+                        clinic_context=clinic_context,
+                        model=OPENAI_MODEL,
+                        temperature=OPENAI_TEMPERATURE,
+                        max_tokens=OPENAI_MAX_TOKENS,
+                        timeout_sec=OPENAI_TIMEOUT_SEC,
+                    )
+
+                    # If you didn't explicitly set EMAIL_SUBJECT, you can let the model provide one
+                    if not os.getenv("EMAIL_SUBJECT"):
+                        try:
+                            email_subject = str(drafted.subject).strip() or email_subject
+                        except Exception:
+                            pass
+
+                    try:
+                        email_body = str(drafted.body).strip()
+                    except Exception:
+                        email_body = ""
+
+                    if not email_body:
+                        raise RuntimeError("LangChain returned empty email body")
+
+                    logger.info("🧩 LangChain drafted clinician email. Subject: %s", email_subject)
+
+                except Exception as e:
+                    logger.warning(
+                        "LangChain email drafting failed (%s). Falling back to deterministic email.",
+                        e,
+                    )
+                    email_body = f"""
 Hello Team,
 
 Please review the following high-risk patient notes and follow-up recommendations
 from {start_date.date()} to {end_date.date()}:
 
-{chr(10).join(sections)}
+{patient_summaries}
 
 Regards,
 Your Clinical Risk Bot
-"""
+""".strip()
+
+            else:
+                # Deterministic email (no extra LLM call)
+                email_body = f"""
+Hello Team,
+
+Please review the following high-risk patient notes and follow-up recommendations
+from {start_date.date()} to {end_date.date()}:
+
+{patient_summaries}
+
+Regards,
+Your Clinical Risk Bot
+""".strip()
+
             if dry_run_email:
                 logger.info("🧪 DRY_RUN_EMAIL=true — skipping SES send. Email body below:\n%s", email_body)
             else:
@@ -672,6 +900,7 @@ Your Clinical Risk Bot
         "ecs_task_id": os.getenv("TASK_ID"),
         "ecs_log_stream": os.getenv("LOG_STREAM", "unknown"),
         "run_id": os.getenv("RUN_ID", "unknown"),
+        "use_langchain": USE_LANGCHAIN,
     }
 
     audit_bucket = os.getenv("AUDIT_BUCKET", output_bucket)

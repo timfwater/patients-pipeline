@@ -42,12 +42,22 @@ IMAGE_TAG="${IMAGE_TAG:-}"
 FORCE_BUILD="${FORCE_BUILD:-false}"
 NO_CACHE="${NO_CACHE:-false}"
 
-# If tag not specified: prefer git short SHA; else timestamp
+# -----------------------
+# Option A (BEST PRACTICE):
+# Default tag is ALWAYS unique per run (timestamp), optionally enriched with git SHA.
+# This prevents "stale image" issues when you haven't committed changes.
+# -----------------------
 if [[ -z "$IMAGE_TAG" ]]; then
+  ts="$(date +%Y%m%d-%H%M%S)"
   if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    IMAGE_TAG="$(git -C "$ROOT_DIR" rev-parse --short HEAD)"
+    sha="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo nogit)"
+    dirty=""
+    if ! git -C "$ROOT_DIR" diff --quiet >/dev/null 2>&1 || ! git -C "$ROOT_DIR" diff --cached --quiet >/dev/null 2>&1; then
+      dirty="-dirty"
+    fi
+    IMAGE_TAG="${ts}-${sha}${dirty}"
   else
-    IMAGE_TAG="$(date +%Y%m%d-%H%M%S)"
+    IMAGE_TAG="${ts}-nogit"
   fi
 fi
 
@@ -160,3 +170,6 @@ fi
 echo "${IMAGE_REPO}:${TAG}" > "$ROOT_DIR/.last_image_uri"
 cyan "📄 Saved image URI to $ROOT_DIR/.last_image_uri"
 green "🎯 Image ready: ${IMAGE_REPO}:${TAG}\n"
+
+# Print the IMAGE_URI as the *last line* so callers can capture it reliably.
+echo "${IMAGE_REPO}:${TAG}"

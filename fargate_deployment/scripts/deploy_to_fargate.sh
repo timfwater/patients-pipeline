@@ -28,19 +28,33 @@ if ! command -v jq >/dev/null 2>&1; then
   echo "❌ 'jq' is required on PATH"; exit 1
 fi
 
-# ========= Resolve image =========
-if [[ -z "${IMAGE_URI:-}" && -f "$ROOT_DIR/.last_image_uri" ]]; then
-  IMAGE_URI="$(cat "$ROOT_DIR/.last_image_uri")"
-  echo "ℹ️  Using IMAGE_URI from .last_image_uri -> $IMAGE_URI"
-fi
+# ========= Resolve image (Option A) =========
+# Priority:
+#   1) IMAGE_URI already set by caller or config.env
+#   2) Otherwise, build+push now and capture IMAGE_URI from the last line of build_and_push.sh output
+#
+# IMPORTANT: build_and_push.sh must print the final image URI as its last line (we added that).
 if [[ -z "${IMAGE_URI:-}" ]]; then
-  if [[ -n "${ECR_REPO_URI:-}" ]]; then
-    IMAGE_URI="$ECR_REPO_URI"
-  else
-    echo "❌ Provide IMAGE_URI or ECR_REPO_URI in config.env (or ensure .last_image_uri exists)"; exit 1
+  BUILD_SCRIPT="$SCRIPT_DIR/build_and_push.sh"
+  if [[ ! -x "$BUILD_SCRIPT" ]]; then
+    echo "❌ Expected executable build script at: $BUILD_SCRIPT"
+    echo "   Make sure build_and_push.sh exists in the same folder as deploy_to_fargate.sh and is chmod +x"
+    exit 1
   fi
+
+  echo "🐳 No IMAGE_URI provided — building & pushing a fresh image via: $BUILD_SCRIPT"
+  IMAGE_URI="$("$BUILD_SCRIPT" | tail -n 1 | tr -d '[:space:]')"
+  if [[ -z "$IMAGE_URI" ]]; then
+    echo "❌ build_and_push.sh did not return an IMAGE_URI (last line was empty)."
+    exit 1
+  fi
+  echo "✅ Using freshly built IMAGE_URI -> $IMAGE_URI"
+else
+  echo "ℹ️  Using IMAGE_URI from env/config -> $IMAGE_URI"
 fi
-[[ "$IMAGE_URI" == *:* ]] || IMAGE_URI="${IMAGE_URI}:latest"
+
+# Require tag
+[[ "$IMAGE_URI" == *:* ]] || { echo "❌ IMAGE_URI must include a tag (e.g., :abc123). Got: $IMAGE_URI"; exit 1; }
 
 # ========= Resolve cluster / roles =========
 : "${CLUSTER_NAME:=${ECS_CLUSTER_NAME:-}}"
@@ -121,6 +135,10 @@ fi
 : "${RAG_TOP_K:=4}"
 : "${RAG_MAX_CHARS:=2500}"
 : "${RAG_AUDIT_MAX_CHARS:=1200}"
+: "${USE_LANGCHAIN:=true}"
+: "${OPENAI_TEMPERATURE:=0}"
+: "${OPENAI_MAX_TOKENS:=800}"
+: "${OPENAI_TIMEOUT_SEC:=60}"
 
 
 # ========= Secrets (OpenAI) handling =========
@@ -164,6 +182,10 @@ ENV_JSON="$(jq -n \
   --arg EMAIL_SUBJECT     "${EMAIL_SUBJECT:-High-Risk Patient Report}" \
   --arg OPENAI_MODEL      "${OPENAI_MODEL:-}" \
   --arg OPENAI_THROTTLE   "${OPENAI_THROTTLE_SEC:-}" \
+  --arg USE_LANGCHAIN     "${USE_LANGCHAIN:-true}" \
+  --arg OPENAI_TEMPERATURE "${OPENAI_TEMPERATURE:-0}" \
+  --arg OPENAI_MAX_TOKENS  "${OPENAI_MAX_TOKENS:-800}" \
+  --arg OPENAI_TIMEOUT_SEC "${OPENAI_TIMEOUT_SEC:-60}" \
   --arg AUDIT_BUCKET      "${AUDIT_BUCKET:-}" \
   --arg AUDIT_PREFIX      "${AUDIT_PREFIX:-}" \
   --arg RUN_ID            "$RUN_ID" \
@@ -191,6 +213,12 @@ ENV_JSON="$(jq -n \
     {name:"EMAIL_SUBJECT",        value:$EMAIL_SUBJECT},
     {name:"OPENAI_MODEL",         value:$OPENAI_MODEL},
     {name:"OPENAI_THROTTLE_SEC",  value:$OPENAI_THROTTLE},
+
+    {name:"USE_LANGCHAIN",        value:$USE_LANGCHAIN},
+    {name:"OPENAI_TEMPERATURE",   value:$OPENAI_TEMPERATURE},
+    {name:"OPENAI_MAX_TOKENS",    value:$OPENAI_MAX_TOKENS},
+    {name:"OPENAI_TIMEOUT_SEC",   value:$OPENAI_TIMEOUT_SEC},
+
     {name:"AUDIT_BUCKET",         value:$AUDIT_BUCKET},
     {name:"AUDIT_PREFIX",         value:$AUDIT_PREFIX},
     {name:"RUN_ID",               value:$RUN_ID},
@@ -207,6 +235,7 @@ ENV_JSON="$(jq -n \
     {name:"RAG_AUDIT_MAX_CHARS",  value:$RAG_AUDIT_MAX_CHARS}
   ]
 ')"
+
 
 
 # If using plaintext API key, append it to env
