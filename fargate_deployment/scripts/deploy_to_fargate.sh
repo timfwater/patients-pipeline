@@ -33,7 +33,7 @@ fi
 #   1) IMAGE_URI already set by caller or config.env
 #   2) Otherwise, build+push now and capture IMAGE_URI from the last line of build_and_push.sh output
 #
-# IMPORTANT: build_and_push.sh must print the final image URI as its last line (we added that).
+# IMPORTANT: build_and_push.sh must print the final image URI as its last line.
 if [[ -z "${IMAGE_URI:-}" ]]; then
   BUILD_SCRIPT="$SCRIPT_DIR/build_and_push.sh"
   if [[ ! -x "$BUILD_SCRIPT" ]]; then
@@ -85,7 +85,7 @@ fi
 echo "🚀 Deploying task to Fargate in $AWS_REGION"
 echo "ℹ️  Cluster=$CLUSTER_NAME  Image=$IMAGE_URI"
 
-STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" --query 'clusters[0].status' --output text 2>/dev/null || echo "MISSING")
+STATUS="$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" --query 'clusters[0].status' --output text 2>/dev/null || echo "MISSING")"
 if [[ "$STATUS" == "INACTIVE" ]]; then
   echo "ℹ️  ECS cluster '$CLUSTER_NAME' is INACTIVE; recreating..."
   aws ecs delete-cluster --cluster "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null 2>&1 || true
@@ -140,6 +140,20 @@ fi
 : "${OPENAI_MAX_TOKENS:=800}"
 : "${OPENAI_TIMEOUT_SEC:=60}"
 
+# Embeddings knobs
+: "${RAG_MODE:=embeddings}"
+: "${RAG_EMBED_MODEL_ID:=sentence-transformers/all-MiniLM-L6-v2}"
+: "${RAG_EMBED_DEVICE:=cpu}"
+: "${RAG_EMBED_BATCH_SIZE:=32}"
+: "${RAG_EMBED_MAX_LENGTH:=256}"
+: "${RAG_EMBED_NORMALIZE:=true}"
+
+echo "[deploy] RAG_ENABLED=$RAG_ENABLED RAG_MODE=$RAG_MODE RAG_EMBED_MODEL_ID=$RAG_EMBED_MODEL_ID"
+
+# If RAG is enabled, KB path must be provided
+if [[ "${RAG_ENABLED}" == "true" && -z "${RAG_KB_PATH}" ]]; then
+  echo "❌ RAG_ENABLED=true but RAG_KB_PATH is empty. Set RAG_KB_PATH in config.env"; exit 1
+fi
 
 # ========= Secrets (OpenAI) handling =========
 SECRETS_JSON='[]'
@@ -153,6 +167,7 @@ if [[ -n "${OPENAI_API_KEY_SECRET_NAME:-}" ]]; then
   if [[ -z "${SECRET_ARN:-}" || "$SECRET_ARN" == "None" ]]; then
     echo "❌ Could not resolve secret '$OPENAI_API_KEY_SECRET_NAME' in region $AWS_REGION"; exit 1
   fi
+
   # Detect JSON vs plaintext secret
   SECRET_STR="$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" --query SecretString --output text 2>/dev/null || true)"
   : "${OPENAI_SECRET_JSON_KEY:=OPENAI_API_KEY}"
@@ -199,6 +214,12 @@ ENV_JSON="$(jq -n \
   --arg RAG_TOP_K         "$RAG_TOP_K" \
   --arg RAG_MAX_CHARS     "$RAG_MAX_CHARS" \
   --arg RAG_AUDIT_MAX_CHARS "$RAG_AUDIT_MAX_CHARS" \
+  --arg RAG_MODE              "$RAG_MODE" \
+  --arg RAG_EMBED_MODEL_ID    "$RAG_EMBED_MODEL_ID" \
+  --arg RAG_EMBED_DEVICE      "$RAG_EMBED_DEVICE" \
+  --arg RAG_EMBED_BATCH_SIZE  "$RAG_EMBED_BATCH_SIZE" \
+  --arg RAG_EMBED_MAX_LENGTH  "$RAG_EMBED_MAX_LENGTH" \
+  --arg RAG_EMBED_NORMALIZE   "$RAG_EMBED_NORMALIZE" \
   '
   [
     {name:"AWS_REGION",           value:$AWS_REGION},
@@ -232,15 +253,20 @@ ENV_JSON="$(jq -n \
     {name:"RAG_KB_PATH",          value:$RAG_KB_PATH},
     {name:"RAG_TOP_K",            value:$RAG_TOP_K},
     {name:"RAG_MAX_CHARS",        value:$RAG_MAX_CHARS},
-    {name:"RAG_AUDIT_MAX_CHARS",  value:$RAG_AUDIT_MAX_CHARS}
+    {name:"RAG_AUDIT_MAX_CHARS",  value:$RAG_AUDIT_MAX_CHARS},
+
+    {name:"RAG_MODE",             value:$RAG_MODE},
+    {name:"RAG_EMBED_MODEL_ID",   value:$RAG_EMBED_MODEL_ID},
+    {name:"RAG_EMBED_DEVICE",     value:$RAG_EMBED_DEVICE},
+    {name:"RAG_EMBED_BATCH_SIZE", value:$RAG_EMBED_BATCH_SIZE},
+    {name:"RAG_EMBED_MAX_LENGTH", value:$RAG_EMBED_MAX_LENGTH},
+    {name:"RAG_EMBED_NORMALIZE",  value:$RAG_EMBED_NORMALIZE}
   ]
 ')"
 
-
-
-# If using plaintext API key, append it to env
+# If using plaintext API key, append it to env (safe jq escaping)
 if [[ -n "${OPENAI_API_KEY:-}" ]]; then
-  ENV_JSON="$(echo "$ENV_JSON" | jq '. + [{"name":"OPENAI_API_KEY","value":"'"$OPENAI_API_KEY"'"}]')"
+  ENV_JSON="$(echo "$ENV_JSON" | jq --arg k "$OPENAI_API_KEY" '. + [{"name":"OPENAI_API_KEY","value":$k}]')"
 fi
 
 # ========= Render task definition from template =========
@@ -292,6 +318,7 @@ IFS=',' read -r -a SUBNET_ARRAY <<< "$SUBNET_IDS"
 if ((${#SUBNET_ARRAY[@]} == 0)); then
   echo "❌ FARGATE_SUBNET_IDS/SUBNET_IDS not set"; exit 1
 fi
+
 if [[ -z "${ASSIGN_PUBLIC_IP:-}" || "${ASSIGN_PUBLIC_IP}" == "AUTO" ]]; then
   AUTO_PUBLIC="DISABLED"
   for sn in "${SUBNET_ARRAY[@]}"; do
@@ -346,18 +373,22 @@ DESC_JSON="$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$TASK_ARN
 EXIT_CODE="$(echo "$DESC_JSON" | jq -r '.tasks[0].containers[0].exitCode // empty')"
 STOPPED_REASON="$(echo "$DESC_JSON" | jq -r '.tasks[0].stoppedReason // empty')"
 CONTAINER_REASON="$(echo "$DESC_JSON" | jq -r '.tasks[0].containers[0].reason // empty')"
+LOG_STREAM_NAME="$(echo "$DESC_JSON" | jq -r '.tasks[0].containers[0].logStreamName // empty')"
 
 echo "🧾 Task stopped. stoppedReason: ${STOPPED_REASON:-<none>}"
 [[ -n "$CONTAINER_REASON" ]] && echo "🧾 Container reason: $CONTAINER_REASON"
 [[ -n "$EXIT_CODE" && "$EXIT_CODE" != "null" ]] && echo "🧪 Exit code: $EXIT_CODE"
+[[ -n "$LOG_STREAM_NAME" && "$LOG_STREAM_NAME" != "null" ]] && echo "📡 Log stream: $LOG_STREAM_NAME"
 
-# Log stream matches: $LOG_STREAM_PREFIX/$CONTAINER_NAME/<taskId>
-TASK_ID="$(echo "$TASK_ARN" | awk -F/ '{print $NF}')"
 echo "📜 Last 120 log events (if available):"
-aws logs get-log-events \
-  --log-group-name "$LOG_GROUP" \
-  --log-stream-name "$LOG_STREAM_PREFIX/$CONTAINER_NAME/$TASK_ID" \
-  --limit 120 --region "$AWS_REGION" || true
+if [[ -n "$LOG_STREAM_NAME" && "$LOG_STREAM_NAME" != "null" ]]; then
+  aws logs get-log-events \
+    --log-group-name "$LOG_GROUP" \
+    --log-stream-name "$LOG_STREAM_NAME" \
+    --limit 120 --region "$AWS_REGION" || true
+else
+  echo "⚠️  ECS did not report logStreamName (logConfiguration/permissions issue)."
+fi
 
 if [[ -z "$EXIT_CODE" || "$EXIT_CODE" == "null" ]]; then
   echo "⚠️  No container exit code reported. This often means an early image pull/network error."

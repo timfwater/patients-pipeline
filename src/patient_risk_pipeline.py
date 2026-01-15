@@ -80,6 +80,52 @@ def _configure_logging():
 
 logger = _configure_logging()
 
+
+# =========================
+# RAG run metadata helpers
+# =========================
+def _get_rag_kb_rows(index_obj) -> int | None:
+    """Best-effort: how many KB rows are in the index."""
+    try:
+        df = getattr(index_obj, "df", None)
+        if df is not None and hasattr(df, "shape"):
+            return int(df.shape[0])
+    except Exception:
+        pass
+    return None
+
+
+def _rag_run_metadata(index_obj) -> dict:
+    """
+    Returns a dict of RAG-related fields for audit logging.
+    Always includes rag_enabled/mode/basic knobs.
+    Adds embeddings knobs if mode==embeddings.
+    """
+    rag_enabled = os.getenv("RAG_ENABLED", "false").lower() == "true"
+    rag_mode = os.getenv("RAG_MODE", "tfidf").lower()
+
+    meta = {
+        "rag_enabled": rag_enabled,
+        "rag_mode": rag_mode,
+        "rag_kb_path": os.getenv("RAG_KB_PATH", ""),
+        "rag_top_k": int(os.getenv("RAG_TOP_K", "4") or 4),
+        "rag_max_chars": int(os.getenv("RAG_MAX_CHARS", "2500") or 2500),
+        "rag_audit_max_chars": int(os.getenv("RAG_AUDIT_MAX_CHARS", "1200") or 1200),
+        "rag_kb_rows": _get_rag_kb_rows(index_obj),
+    }
+
+    if rag_enabled and rag_mode == "embeddings":
+        meta.update({
+            "rag_embed_model_id": os.getenv("RAG_EMBED_MODEL_ID", ""),
+            "rag_embed_device": os.getenv("RAG_EMBED_DEVICE", ""),
+            "rag_embed_batch_size": int(os.getenv("RAG_EMBED_BATCH_SIZE", "0") or 0),
+            "rag_embed_max_length": int(os.getenv("RAG_EMBED_MAX_LENGTH", "0") or 0),
+            "rag_embed_normalize": os.getenv("RAG_EMBED_NORMALIZE", "").lower(),
+        })
+
+    return meta
+
+
 # =========================
 # RAG
 # =========================
@@ -95,9 +141,23 @@ except Exception as e:
 # --- RAG startup diagnostics (helps you confirm ON/OFF immediately) ---
 logger.info("🧠 RAG_INDEX loaded: %s", "YES" if RAG_INDEX is not None else "NO")
 logger.info("🧠 RAG_ENABLED=%s", os.getenv("RAG_ENABLED", "unset"))
+logger.info("🧠 RAG_MODE=%s", os.getenv("RAG_MODE", "tfidf"))
 logger.info("🧠 RAG_KB_PATH=%s", os.getenv("RAG_KB_PATH", "unset"))
 logger.info("🧠 RAG_TOP_K=%s", os.getenv("RAG_TOP_K", "unset"))
 logger.info("🧠 RAG_MAX_CHARS=%s", os.getenv("RAG_MAX_CHARS", "unset"))
+
+# If embeddings mode, log the embedding config explicitly (portfolio/debug proof)
+if os.getenv("RAG_MODE", "tfidf").lower() == "embeddings":
+    logger.info(
+        "🧠 Embeddings config: model=%s device=%s batch=%s max_len=%s normalize=%s kb_rows=%s",
+        os.getenv("RAG_EMBED_MODEL_ID", "unset"),
+        os.getenv("RAG_EMBED_DEVICE", "unset"),
+        os.getenv("RAG_EMBED_BATCH_SIZE", "unset"),
+        os.getenv("RAG_EMBED_MAX_LENGTH", "unset"),
+        os.getenv("RAG_EMBED_NORMALIZE", "unset"),
+        str(_get_rag_kb_rows(RAG_INDEX)),
+    )
+
 
 # =========================
 # OpenAI API key resolution
@@ -135,10 +195,12 @@ def _extract_openai_key_from_secret_string(secret_string: str) -> str:
     # If it looked like JSON but we couldn't extract a field, return raw string
     return s
 
+
 def _get_openai_key_from_secrets(secret_name: str, region_name: str) -> str:
     client = boto3.client("secretsmanager", region_name=region_name)
     resp = client.get_secret_value(SecretId=secret_name)
     return _extract_openai_key_from_secret_string(resp.get("SecretString", "") or "")
+
 
 def get_openai_key() -> str:
     """
@@ -163,6 +225,7 @@ def get_openai_key() -> str:
             f"❌ Failed to retrieve OpenAI API key from Secrets Manager "
             f"(secret='{secret_name}', region='{region}'): {e}"
         )
+
 
 # Initialize OpenAI client (unless disabled)
 OPENAI_CLIENT: OpenAI | None = None
@@ -233,10 +296,12 @@ def get_ecs_metadata_task_id():
         logger.warning(f"Could not retrieve ECS metadata: {e}")
     return None
 
+
 # Set task ID in environment (used in audit logging)
 ecs_task_id = get_ecs_metadata_task_id()
 os.environ["TASK_ID"] = ecs_task_id or os.getenv("TASK_ID", "unknown")
 os.environ["RUN_ID"] = os.getenv("RUN_ID", datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+
 
 def extract_risk_score(text):
     """
@@ -258,6 +323,7 @@ def extract_risk_score(text):
     except Exception:
         return None
     return None
+
 
 # --- Robust OpenAI caller with backoff + jitter + optional throttle ---
 def get_chat_response(
@@ -284,7 +350,7 @@ def get_chat_response(
         timeout_sec = OPENAI_TIMEOUT_SEC
 
     if LLM_DISABLED:
-        if inquiry_note.strip().startswith("Please assume the role"):
+        if str(inquiry_note).strip().startswith("Please assume the role"):
             return {"message": {"content": "Risk Score: 72\nLikely follow-up needed."}}
         return {"message": {"content": (
             "Follow-up 1 month: Yes\n"
@@ -344,12 +410,14 @@ def get_chat_response(
     logger.error("All retries failed for OpenAI API. Last error: %s", last_err)
     return {"message": {"content": ""}}
 
+
 def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
     if not s3_uri.startswith("s3://"):
         raise ValueError(f"Expected s3://... URI, got: {s3_uri}")
     bucket_key = s3_uri.replace("s3://", "", 1)
     bucket, key = bucket_key.split("/", 1)
     return bucket, key
+
 
 def _read_csv_s3_in_chunks(s3_client, s3_uri: str, chunksize: int, aws_region: str):
     """
@@ -372,6 +440,7 @@ def _read_csv_s3_in_chunks(s3_client, s3_uri: str, chunksize: int, aws_region: s
     obj = s3_client.get_object(Bucket=bucket, Key=key)
     text_stream = TextIOWrapper(obj["Body"], encoding="utf-8")
     return pd.read_csv(text_stream, chunksize=chunksize)
+
 
 # -----------------------------
 # LangChain wedge (optional)
@@ -426,6 +495,7 @@ def _risk_rating_via_langchain(note_text: str) -> tuple[str, str | None]:
         logger.warning("LangChain assessment failed (%s). Falling back to OpenAI path.", e)
         return get_chat_response(RISK_PROMPT + str(note_text))["message"]["content"], None
 
+
 def query_combined_prompt(note, template=COMBINED_PROMPT):
     note_text = str(note)
 
@@ -479,6 +549,7 @@ def query_combined_prompt(note, template=COMBINED_PROMPT):
     response = get_chat_response(prompt)["message"]["content"]
     return response, rag_audit_text
 
+
 def safe_split(line, label):
     try:
         lhs, rhs = line.split(":", 1)
@@ -487,6 +558,7 @@ def safe_split(line, label):
     except Exception:
         pass
     return None
+
 
 def parse_response_and_concerns(text):
     try:
@@ -535,6 +607,7 @@ def parse_response_and_concerns(text):
             index=["follow_up_1mo", "follow_up_6mo", "oncology_rec", "cardiology_rec", "top_concerns"],
         )
 
+
 def log_audit_summary(s3_client, bucket, key, summary, retries=3):
     payload = json.dumps(summary, indent=2).encode("utf-8")
     delay = 1.0
@@ -548,6 +621,7 @@ def log_audit_summary(s3_client, bucket, key, summary, retries=3):
             logger.warning(f"S3 audit put failed (attempt {attempt+1}): {e}; retrying in {delay:.1f}s")
             time.sleep(delay)
             delay *= 2
+
 
 # =========
 # Main (streaming, chunked)
@@ -653,8 +727,12 @@ def run_pipeline(
                     "run_duration_sec": round(time.time() - start_time, 2),
                     "ecs_task_id": os.getenv("TASK_ID"),
                     "ecs_log_stream": os.getenv("LOG_STREAM", "unknown"),
+                    "run_id": os.getenv("RUN_ID", "unknown"),
+                    "use_langchain": USE_LANGCHAIN,
                     "warning": f"Missing required input columns: {missing_cols}",
                 }
+                summary.update(_rag_run_metadata(RAG_INDEX))
+
                 audit_bucket = os.getenv("AUDIT_BUCKET", output_bucket)
                 audit_prefix = os.getenv("AUDIT_PREFIX", "audit_logs")
                 audit_key = f"{audit_prefix}/{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')}_summary.json"
@@ -787,9 +865,7 @@ def run_pipeline(
         if sections:
             patient_summaries = "\n".join(sections).strip()
 
-            # ==========================================================
-            # ✅ INSERTED UPDATE: guardrail truncation for LangChain email
-            # ==========================================================
+            # guardrail truncation for LangChain email
             max_email_chars = int(os.getenv("EMAIL_LLM_MAX_CHARS", "12000"))
             if len(patient_summaries) > max_email_chars:
                 logger.warning(
@@ -797,13 +873,7 @@ def run_pipeline(
                     len(patient_summaries), max_email_chars
                 )
                 patient_summaries = patient_summaries[:max_email_chars] + "\n\n[TRUNCATED]"
-            # ==========================================================
-            # ✅ END INSERTED UPDATE
-            # ==========================================================
 
-            # Option A: Use LangChain to draft a clinician-friendly email from deterministic sections.
-            # This gives you a clear 2nd LangChain-driven LLM call (portfolio signal) while keeping
-            # the "facts" deterministic (reduces hallucination risk).
             if USE_LANGCHAIN:
                 try:
                     from src.llm_chain import draft_clinician_email_with_langchain  # type: ignore
@@ -819,7 +889,6 @@ def run_pipeline(
                         timeout_sec=OPENAI_TIMEOUT_SEC,
                     )
 
-                    # If you didn't explicitly set EMAIL_SUBJECT, you can let the model provide one
                     if not os.getenv("EMAIL_SUBJECT"):
                         try:
                             email_subject = str(drafted.subject).strip() or email_subject
@@ -854,7 +923,6 @@ Your Clinical Risk Bot
 """.strip()
 
             else:
-                # Deterministic email (no extra LLM call)
                 email_body = f"""
 Hello Team,
 
@@ -902,6 +970,7 @@ Your Clinical Risk Bot
         "run_id": os.getenv("RUN_ID", "unknown"),
         "use_langchain": USE_LANGCHAIN,
     }
+    summary.update(_rag_run_metadata(RAG_INDEX))
 
     audit_bucket = os.getenv("AUDIT_BUCKET", output_bucket)
     audit_prefix = os.getenv("AUDIT_PREFIX", "audit_logs")
@@ -910,6 +979,7 @@ Your Clinical Risk Bot
     logger.info("📁 Audit log written to s3://%s/%s", audit_bucket, audit_key)
     logger.info("📊 Run Summary:\n%s", json.dumps(summary, indent=2))
     logger.info("✅ Script completed in %.2f seconds", time.time() - start_time)
+
 
 # ---------- CLI wrapper ----------
 def main():
