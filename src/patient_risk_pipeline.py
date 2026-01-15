@@ -12,13 +12,22 @@ from io import TextIOWrapper
 import boto3
 import pandas as pd
 import requests
-from openai import OpenAI
-from openai import (
-    APIError,
-    APIConnectionError,
-    APITimeoutError,
-    RateLimitError,
-)
+from botocore.exceptions import ClientError, BotoCoreError
+# OpenAI is optional if you run with LLM_PROVIDER=sagemaker
+try:
+    from openai import OpenAI
+    from openai import (
+        APIError,
+        APIConnectionError,
+        RateLimitError,
+        APITimeoutError,
+    )
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
+    class APIError(Exception): ...
+    class APIConnectionError(Exception): ...
+    class RateLimitError(Exception): ...
+    class APITimeoutError(Exception): ...
 
 from src.rag_tfidf import (
     build_index_from_env,
@@ -40,10 +49,26 @@ USE_S3FS = os.getenv("USE_S3FS", "false").lower() == "true"
 
 # LangChain wedge toggle (safe default: off)
 USE_LANGCHAIN = os.getenv("USE_LANGCHAIN", "false").lower() == "true"
+
 # Shared OpenAI runtime knobs (used by both direct OpenAI + LangChain wedge)
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0") or 0)
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "800") or 800)
 OPENAI_TIMEOUT_SEC = int(os.getenv("OPENAI_TIMEOUT_SEC", "60") or 60)
+
+# =========================
+# LLM backend selection
+# =========================
+# openai (default) | sagemaker
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+
+# SageMaker (used when LLM_PROVIDER=sagemaker)
+SAGEMAKER_ENDPOINT_NAME = os.getenv("SAGEMAKER_ENDPOINT_NAME", "").strip()
+SAGEMAKER_REGION = os.getenv("SAGEMAKER_REGION", os.getenv("AWS_REGION", "us-east-1")).strip()
+SAGEMAKER_CONTENT_TYPE = os.getenv("SAGEMAKER_CONTENT_TYPE", "application/json").strip()
+
+# Generation knobs for SageMaker path (and optional shared defaults)
+GEN_TEMPERATURE = float(os.getenv("GEN_TEMPERATURE", str(OPENAI_TEMPERATURE)) or 0)
+GEN_MAX_NEW_TOKENS = int(os.getenv("GEN_MAX_NEW_TOKENS", str(OPENAI_MAX_TOKENS)) or 800)
 
 # =========
 # Logging
@@ -164,15 +189,21 @@ def get_openai_key() -> str:
             f"(secret='{secret_name}', region='{region}'): {e}"
         )
 
-# Initialize OpenAI client (unless disabled)
+# Initialize OpenAI client only if needed (unless disabled)
 OPENAI_CLIENT: OpenAI | None = None
-if not LLM_DISABLED:
+if (not LLM_DISABLED) and (LLM_PROVIDER == "openai"):
+    if OpenAI is None:
+        raise ImportError("openai package is required when LLM_PROVIDER=openai. Install 'openai' or set LLM_PROVIDER=sagemaker.")
     OPENAI_CLIENT = OpenAI(api_key=get_openai_key())
 
 logger.info("✅ SCRIPT IS RUNNING")
 logger.info("📡 ECS log stream: %s", os.getenv("LOG_STREAM", "unknown"))
 logger.info("🆔 ECS task ID: %s", os.getenv("TASK_ID", "unknown"))
 logger.info("🧩 USE_LANGCHAIN=%s", USE_LANGCHAIN)
+logger.info("🧠 LLM_PROVIDER=%s", LLM_PROVIDER)
+if LLM_PROVIDER == "sagemaker":
+    logger.info("🧠 SAGEMAKER_ENDPOINT_NAME=%s", SAGEMAKER_ENDPOINT_NAME or "(unset)")
+    logger.info("🧠 SAGEMAKER_REGION=%s", SAGEMAKER_REGION)
 
 # ========
 # Prompts
@@ -259,7 +290,68 @@ def extract_risk_score(text):
         return None
     return None
 
-# --- Robust OpenAI caller with backoff + jitter + optional throttle ---
+def _invoke_sagemaker_textgen(prompt: str, *, temperature: float, max_new_tokens: int) -> str:
+    """
+    Invoke a SageMaker real-time endpoint for text generation.
+
+    Uses a common Hugging Face text-generation payload:
+      {"inputs": prompt,
+       "parameters": {"temperature": 0.0, "max_new_tokens": 800, "return_full_text": false}}
+
+    Response shapes vary by container; we parse several common ones.
+    """
+    if not SAGEMAKER_ENDPOINT_NAME:
+        raise RuntimeError("LLM_PROVIDER=sagemaker but SAGEMAKER_ENDPOINT_NAME is empty")
+
+    smrt = boto3.client("sagemaker-runtime", region_name=SAGEMAKER_REGION)
+
+    payload = {
+        "inputs": str(prompt),
+        "parameters": {
+            "temperature": float(temperature),
+            "max_new_tokens": int(max_new_tokens),
+            "return_full_text": False,
+        },
+    }
+
+    try:
+        resp = smrt.invoke_endpoint(
+            EndpointName=SAGEMAKER_ENDPOINT_NAME,
+            ContentType=SAGEMAKER_CONTENT_TYPE,
+            Body=json.dumps(payload).encode("utf-8"),
+        )
+        raw = resp["Body"].read().decode("utf-8")
+    except (ClientError, BotoCoreError) as e:
+        raise RuntimeError(f"SageMaker invoke_endpoint failed: {e}") from e
+
+    # Try JSON parse; fall back to raw string
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return raw
+
+    # Common shapes:
+    # 1) [{"generated_text":"..."}]
+    if isinstance(data, list) and data:
+        first = data[0]
+        if isinstance(first, dict):
+            for k in ("generated_text", "text", "output_text"):
+                v = first.get(k)
+                if isinstance(v, str):
+                    return v
+        if isinstance(first, str):
+            return first
+
+    # 2) {"generated_text":"..."} or {"outputs":"..."}
+    if isinstance(data, dict):
+        for k in ("generated_text", "text", "outputs", "output"):
+            v = data.get(k)
+            if isinstance(v, str):
+                return v
+
+    return json.dumps(data)
+
+# --- Robust caller with backoff + jitter + optional throttle ---
 def get_chat_response(
     inquiry_note,
     model=OPENAI_MODEL,
@@ -271,20 +363,16 @@ def get_chat_response(
     timeout_sec: int | None = None,
 ):
     """
-    Calls OpenAI Chat Completions (OpenAI Python SDK v1.x) with exponential backoff and jitter.
+    Calls the configured LLM backend (OpenAI or SageMaker) with exponential backoff and jitter.
     Respects GLOBAL_THROTTLE between calls if set via env OPENAI_THROTTLE_SEC.
-    Uses shared knobs (temperature/max_tokens/timeout) unless explicitly overridden.
+
+    - OpenAI path uses OPENAI_TEMPERATURE / OPENAI_MAX_TOKENS / OPENAI_TIMEOUT_SEC unless overridden.
+    - SageMaker path uses GEN_TEMPERATURE / GEN_MAX_NEW_TOKENS unless overridden.
+
     If LLM_DISABLED=true, returns a deterministic stub.
     """
-    if temperature is None:
-        temperature = OPENAI_TEMPERATURE
-    if max_tokens is None:
-        max_tokens = OPENAI_MAX_TOKENS
-    if timeout_sec is None:
-        timeout_sec = OPENAI_TIMEOUT_SEC
-
     if LLM_DISABLED:
-        if inquiry_note.strip().startswith("Please assume the role"):
+        if str(inquiry_note).strip().startswith("Please assume the role"):
             return {"message": {"content": "Risk Score: 72\nLikely follow-up needed."}}
         return {"message": {"content": (
             "Follow-up 1 month: Yes\n"
@@ -295,8 +383,50 @@ def get_chat_response(
             "1. Hypertension\n2. A1c elevation\n3. Chest pain\n4. Medication adherence\n5. BMI"
         )}}
 
+    # Defaults
+    if temperature is None:
+        temperature = OPENAI_TEMPERATURE if LLM_PROVIDER == "openai" else GEN_TEMPERATURE
+    if max_tokens is None:
+        max_tokens = OPENAI_MAX_TOKENS if LLM_PROVIDER == "openai" else GEN_MAX_NEW_TOKENS
+    if timeout_sec is None:
+        timeout_sec = OPENAI_TIMEOUT_SEC
+
+    # -------------------------
+    # SageMaker backend
+    # -------------------------
+    if LLM_PROVIDER == "sagemaker":
+        last_err = None
+        for attempt in range(retries):
+            try:
+                if GLOBAL_THROTTLE > 0:
+                    time.sleep(GLOBAL_THROTTLE)
+
+                text = _invoke_sagemaker_textgen(
+                    str(inquiry_note),
+                    temperature=float(temperature),
+                    max_new_tokens=int(max_tokens),
+                )
+                return {"message": {"content": text}}
+
+            except Exception as e:
+                last_err = e
+                sleep_s = min(max_delay, base_delay * (2 ** attempt)) * (0.5 + random.random())
+                logger.warning(
+                    "SageMaker transient error on attempt %d: %s. Backing off %.1fs...",
+                    attempt + 1, e, sleep_s
+                )
+                time.sleep(sleep_s)
+
+        logger.error("All retries failed for SageMaker endpoint. Last error: %s", last_err)
+        return {"message": {"content": ""}}
+
+    # -------------------------
+    # OpenAI backend (default)
+    # -------------------------
     if OPENAI_CLIENT is None:
-        raise RuntimeError("OPENAI_CLIENT not initialized (check LLM_DISABLED and OPENAI_API_KEY injection).")
+        raise RuntimeError(
+            "OPENAI_CLIENT not initialized (check LLM_PROVIDER=openai, LLM_DISABLED, and OPENAI_API_KEY injection)."
+        )
 
     last_err = None
     for attempt in range(retries):
@@ -391,7 +521,7 @@ def _risk_rating_via_langchain(note_text: str) -> tuple[str, str | None]:
     try:
         from src.llm_chain import assess_note_with_langchain  # type: ignore
     except Exception as e:
-        logger.warning("USE_LANGCHAIN=true but src.llm_chain import failed (%s). Falling back to OpenAI path.", e)
+        logger.warning("USE_LANGCHAIN=true but src.llm_chain import failed (%s). Falling back to base LLM path.", e)
         return get_chat_response(RISK_PROMPT + str(note_text))["message"]["content"], None
 
     try:
@@ -423,7 +553,7 @@ def _risk_rating_via_langchain(note_text: str) -> tuple[str, str | None]:
 
         return risk_text, (rationale if rationale else None)
     except Exception as e:
-        logger.warning("LangChain assessment failed (%s). Falling back to OpenAI path.", e)
+        logger.warning("LangChain assessment failed (%s). Falling back to base LLM path.", e)
         return get_chat_response(RISK_PROMPT + str(note_text))["message"]["content"], None
 
 def query_combined_prompt(note, template=COMBINED_PROMPT):
@@ -901,6 +1031,8 @@ Your Clinical Risk Bot
         "ecs_log_stream": os.getenv("LOG_STREAM", "unknown"),
         "run_id": os.getenv("RUN_ID", "unknown"),
         "use_langchain": USE_LANGCHAIN,
+        "llm_provider": LLM_PROVIDER,
+        "sagemaker_endpoint": SAGEMAKER_ENDPOINT_NAME if LLM_PROVIDER == "sagemaker" else None,
     }
 
     audit_bucket = os.getenv("AUDIT_BUCKET", output_bucket)
