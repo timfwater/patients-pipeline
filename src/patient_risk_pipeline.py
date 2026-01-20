@@ -26,76 +26,8 @@ from src.rag_tfidf import (
     retrieve_kb,
     format_rag_context,
 )
-
-# =========================
-# Config knobs (env-override)
-# =========================
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-GLOBAL_THROTTLE = float(os.getenv("OPENAI_THROTTLE_SEC", "0") or 0)
-LLM_DISABLED = os.getenv("LLM_DISABLED", "false").lower() == "true"  # for fast smoke tests
-CSV_CHUNK_ROWS = int(os.getenv("CSV_CHUNK_ROWS", "5000"))  # streaming chunk size
-OUTPUT_TMP = os.getenv("OUTPUT_TMP", "/tmp/output.csv")    # local rolling output
-
-# If true, prefer pandas+s3fs path reading; otherwise stream via boto3 (safer in containers)
-USE_S3FS = os.getenv("USE_S3FS", "false").lower() == "true"
-
-# LangChain wedge toggle (safe default: off)
-USE_LANGCHAIN = os.getenv("USE_LANGCHAIN", "false").lower() == "true"
-
-# Shared OpenAI runtime knobs (used by both direct OpenAI + LangChain wedge)
-OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0") or 0)
-OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "800") or 800)
-OPENAI_TIMEOUT_SEC = int(os.getenv("OPENAI_TIMEOUT_SEC", "60") or 60)
-
-# =========================
-# LLM backend selection
-# =========================
-# openai (default) | sagemaker
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
-
-# SageMaker (used when LLM_PROVIDER=sagemaker)
-SAGEMAKER_ENDPOINT_NAME = os.getenv("SAGEMAKER_ENDPOINT_NAME", "").strip()
-SAGEMAKER_REGION = os.getenv("SAGEMAKER_REGION", os.getenv("AWS_REGION", "us-east-1")).strip()
-SAGEMAKER_CONTENT_TYPE = os.getenv("SAGEMAKER_CONTENT_TYPE", "application/json").strip()
-
-# Generation knobs for SageMaker path (and optional shared defaults)
-GEN_TEMPERATURE = float(os.getenv("GEN_TEMPERATURE", str(OPENAI_TEMPERATURE)) or 0)
-GEN_MAX_NEW_TOKENS = int(os.getenv("GEN_MAX_NEW_TOKENS", str(OPENAI_MAX_TOKENS)) or 800)
-
-# =========
-# Logging
-# =========
-def _configure_logging():
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
-    fmt_mode = os.getenv("LOG_FORMAT", "text").lower()  # "text" | "json"
-    _logger = logging.getLogger("patient_pipeline")
-    _logger.setLevel(level)
-    handler = logging.StreamHandler()
-
-    if fmt_mode == "json":
-        class JsonFormatter(logging.Formatter):
-            def format(self, record):
-                base = {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "level": record.levelname,
-                    "event": record.getMessage(),
-                    "run_id": os.getenv("RUN_ID", "unknown"),
-                    "task_id": os.getenv("TASK_ID", "unknown"),
-                    "log_stream": os.getenv("LOG_STREAM", "unknown"),
-                }
-                if record.exc_info:
-                    base["exc_info"] = self.formatException(record.exc_info)
-                return json.dumps(base)
-
-        handler.setFormatter(JsonFormatter())
-    else:
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-
-    _logger.handlers = [handler]
-    _logger.propagate = False
-    return _logger
-
-logger = _configure_logging()
+from src.config import *
+from src.logger import logger
 
 # =========================
 # RAG
