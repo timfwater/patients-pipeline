@@ -13,21 +13,13 @@ import boto3
 import pandas as pd
 import requests
 from botocore.exceptions import ClientError, BotoCoreError
-# OpenAI is optional if you run with LLM_PROVIDER=sagemaker
-try:
-    from openai import OpenAI
-    from openai import (
-        APIError,
-        APIConnectionError,
-        RateLimitError,
-        APITimeoutError,
-    )
-except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore
-    class APIError(Exception): ...
-    class APIConnectionError(Exception): ...
-    class RateLimitError(Exception): ...
-    class APITimeoutError(Exception): ...
+from openai import OpenAI
+from openai import (
+    APIError,
+    APIConnectionError,
+    APITimeoutError,
+    RateLimitError,
+)
 
 from src.rag_tfidf import (
     build_index_from_env,
@@ -192,8 +184,6 @@ def get_openai_key() -> str:
 # Initialize OpenAI client only if needed (unless disabled)
 OPENAI_CLIENT: OpenAI | None = None
 if (not LLM_DISABLED) and (LLM_PROVIDER == "openai"):
-    if OpenAI is None:
-        raise ImportError("openai package is required when LLM_PROVIDER=openai. Install 'openai' or set LLM_PROVIDER=sagemaker.")
     OPENAI_CLIENT = OpenAI(api_key=get_openai_key())
 
 logger.info("✅ SCRIPT IS RUNNING")
@@ -290,13 +280,56 @@ def extract_risk_score(text):
         return None
     return None
 
+
+def normalize_hf_parameters(params: dict) -> dict:
+    """
+    Normalize/clean Hugging Face generation parameters for SageMaker-hosted HF inference containers.
+
+    Different serving stacks support different kwargs. To avoid iterative break/fix cycles, we:
+      - drop known-problematic / non-universal kwargs (e.g., return_full_text)
+      - keep a small allowlist of broadly supported generation args
+      - avoid incompatible combinations (e.g., max_new_tokens + max_length)
+    """
+    if not isinstance(params, dict):
+        return {}
+
+    params = dict(params)  # shallow copy
+    # Known non-universal / problematic kwargs
+    params.pop("return_full_text", None)
+
+    allowed = {
+        "temperature",
+        "top_p",
+        "top_k",
+        "do_sample",
+        "repetition_penalty",
+        "max_new_tokens",
+        "max_length",
+        "num_beams",
+        "seed",
+    }
+
+    cleaned = {k: v for k, v in params.items() if k in allowed and v is not None}
+
+    # Prefer max_new_tokens when both are set (many stacks reject both)
+    if "max_new_tokens" in cleaned and "max_length" in cleaned:
+        cleaned.pop("max_length", None)
+
+    # If temperature is 0, sampling should be disabled for consistency
+    if cleaned.get("temperature") in (0, 0.0):
+        cleaned["do_sample"] = False
+        cleaned.pop("top_p", None)
+        cleaned.pop("top_k", None)
+
+    return cleaned
+
 def _invoke_sagemaker_textgen(prompt: str, *, temperature: float, max_new_tokens: int) -> str:
     """
     Invoke a SageMaker real-time endpoint for text generation.
 
     Uses a common Hugging Face text-generation payload:
       {"inputs": prompt,
-       "parameters": {"temperature": 0.0, "max_new_tokens": 800, "return_full_text": false}}
+       "parameters": {"temperature": 0.0, "max_new_tokens": 800}}
 
     Response shapes vary by container; we parse several common ones.
     """
@@ -305,24 +338,41 @@ def _invoke_sagemaker_textgen(prompt: str, *, temperature: float, max_new_tokens
 
     smrt = boto3.client("sagemaker-runtime", region_name=SAGEMAKER_REGION)
 
-    payload = {
-        "inputs": str(prompt),
-        "parameters": {
-            "temperature": float(temperature),
-            "max_new_tokens": int(max_new_tokens),
-            "return_full_text": False,
-        },
+    base_params = {
+        "temperature": float(temperature),
+        "max_new_tokens": int(max_new_tokens),
     }
 
-    try:
+    payload = {
+        "inputs": str(prompt),
+        "parameters": normalize_hf_parameters(base_params),
+    }
+
+    def _do_invoke(p: dict) -> str:
         resp = smrt.invoke_endpoint(
             EndpointName=SAGEMAKER_ENDPOINT_NAME,
             ContentType=SAGEMAKER_CONTENT_TYPE,
-            Body=json.dumps(payload).encode("utf-8"),
+            Body=json.dumps(p).encode("utf-8"),
         )
-        raw = resp["Body"].read().decode("utf-8")
+        return resp["Body"].read().decode("utf-8")
+
+    try:
+        raw = _do_invoke(payload)
     except (ClientError, BotoCoreError) as e:
-        raise RuntimeError(f"SageMaker invoke_endpoint failed: {e}") from e
+        # Common HF pipeline incompatibility: some stacks treat default max_length as "set",
+        # and reject requests that also specify max_new_tokens. If we detect that specific
+        # error, retry once using max_length instead.
+        msg = str(e)
+        if "Both `max_new_tokens` and `max_length`" in msg:
+            params = dict(payload.get("parameters") or {})
+            # switch to max_length using the same numeric budget
+            if "max_new_tokens" in params:
+                params["max_length"] = int(params["max_new_tokens"])
+                params.pop("max_new_tokens", None)
+            payload["parameters"] = normalize_hf_parameters(params)
+            raw = _do_invoke(payload)
+        else:
+            raise RuntimeError(f"SageMaker invoke_endpoint failed: {e}") from e
 
     # Try JSON parse; fall back to raw string
     try:
@@ -410,6 +460,13 @@ def get_chat_response(
 
             except Exception as e:
                 last_err = e
+                msg = str(e)
+                # Deterministic client-side/model-side validation errors (often 400 ModelError)
+                # won't succeed on retry; fail fast to save time/cost.
+                if "ModelError" in msg and "(400)" in msg:
+                    logger.error("SageMaker non-retriable error (400). Aborting retries: %s", e)
+                    break
+
                 sleep_s = min(max_delay, base_delay * (2 ** attempt)) * (0.5 + random.random())
                 logger.warning(
                     "SageMaker transient error on attempt %d: %s. Backing off %.1fs...",
