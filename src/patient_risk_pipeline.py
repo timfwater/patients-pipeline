@@ -12,7 +12,6 @@ from io import TextIOWrapper
 import boto3
 import pandas as pd
 import requests
-from openai import OpenAI
 from openai import (
     APIError,
     APIConnectionError,
@@ -26,59 +25,26 @@ from src.rag_tfidf import (
     format_rag_context,
 )
 
-# =========================
-# Config knobs (env-override)
-# =========================
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-GLOBAL_THROTTLE = float(os.getenv("OPENAI_THROTTLE_SEC", "0") or 0)
-LLM_DISABLED = os.getenv("LLM_DISABLED", "false").lower() == "true"  # for fast smoke tests
-CSV_CHUNK_ROWS = int(os.getenv("CSV_CHUNK_ROWS", "5000"))  # streaming chunk size
-OUTPUT_TMP = os.getenv("OUTPUT_TMP", "/tmp/output.csv")    # local rolling output
+from src.config import (
+    OPENAI_MODEL,
+    GLOBAL_THROTTLE,
+    LLM_DISABLED,
+    CSV_CHUNK_ROWS,
+    OUTPUT_TMP,
+    USE_S3FS,
+    USE_LANGCHAIN,
+    OPENAI_TEMPERATURE,
+    OPENAI_MAX_TOKENS,
+    OPENAI_TIMEOUT_SEC,
+    logger,
+)
 
-# If true, prefer pandas+s3fs path reading; otherwise stream via boto3 (safer in containers)
-USE_S3FS = os.getenv("USE_S3FS", "false").lower() == "true"
-
-# LangChain wedge toggle (safe default: off)
-USE_LANGCHAIN = os.getenv("USE_LANGCHAIN", "false").lower() == "true"
-# Shared OpenAI runtime knobs (used by both direct OpenAI + LangChain wedge)
-OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0") or 0)
-OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "800") or 800)
-OPENAI_TIMEOUT_SEC = int(os.getenv("OPENAI_TIMEOUT_SEC", "60") or 60)
-
-# =========
-# Logging
-# =========
-def _configure_logging():
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
-    fmt_mode = os.getenv("LOG_FORMAT", "text").lower()  # "text" | "json"
-    _logger = logging.getLogger("patient_pipeline")
-    _logger.setLevel(level)
-    handler = logging.StreamHandler()
-
-    if fmt_mode == "json":
-        class JsonFormatter(logging.Formatter):
-            def format(self, record):
-                base = {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "level": record.levelname,
-                    "event": record.getMessage(),
-                    "run_id": os.getenv("RUN_ID", "unknown"),
-                    "task_id": os.getenv("TASK_ID", "unknown"),
-                    "log_stream": os.getenv("LOG_STREAM", "unknown"),
-                }
-                if record.exc_info:
-                    base["exc_info"] = self.formatException(record.exc_info)
-                return json.dumps(base)
-
-        handler.setFormatter(JsonFormatter())
-    else:
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-
-    _logger.handlers = [handler]
-    _logger.propagate = False
-    return _logger
-
-logger = _configure_logging()
+from src.llm import (
+    _risk_rating_via_langchain,
+    get_chat_response,
+    query_combined_prompt,
+    RISK_PROMPT,
+)
 
 # =========================
 # RAG
@@ -98,117 +64,6 @@ logger.info("🧠 RAG_ENABLED=%s", os.getenv("RAG_ENABLED", "unset"))
 logger.info("🧠 RAG_KB_PATH=%s", os.getenv("RAG_KB_PATH", "unset"))
 logger.info("🧠 RAG_TOP_K=%s", os.getenv("RAG_TOP_K", "unset"))
 logger.info("🧠 RAG_MAX_CHARS=%s", os.getenv("RAG_MAX_CHARS", "unset"))
-
-# =========================
-# OpenAI API key resolution
-# =========================
-def _extract_openai_key_from_secret_string(secret_string: str) -> str:
-    """
-    Supports secrets stored as either:
-      - plain text API key
-      - JSON blob with common key names (e.g., {"OPENAI_API_KEY":"..."}).
-    """
-    if not secret_string:
-        return secret_string
-
-    s = secret_string.strip()
-    if not (s.startswith("{") and s.endswith("}")):
-        return s
-
-    try:
-        obj = json.loads(s)
-        if isinstance(obj, dict):
-            for k in [
-                "OPENAI_API_KEY",
-                "openai_api_key",
-                "api_key",
-                "OPENAI_KEY",
-                "openaiKey",
-                "key",
-            ]:
-                v = obj.get(k)
-                if isinstance(v, str) and v.strip():
-                    return v.strip()
-    except Exception:
-        pass
-
-    # If it looked like JSON but we couldn't extract a field, return raw string
-    return s
-
-def _get_openai_key_from_secrets(secret_name: str, region_name: str) -> str:
-    client = boto3.client("secretsmanager", region_name=region_name)
-    resp = client.get_secret_value(SecretId=secret_name)
-    return _extract_openai_key_from_secret_string(resp.get("SecretString", "") or "")
-
-def get_openai_key() -> str:
-    """
-    Prefer ECS-injected env var (OPENAI_API_KEY). If absent, fall back to
-    AWS Secrets Manager using OPENAI_API_KEY_SECRET_NAME or OPENAI_SECRET_NAME.
-    """
-    key = os.getenv("OPENAI_API_KEY")
-    if key and key.strip():
-        return key.strip()
-
-    secret_name = (
-        os.getenv("OPENAI_API_KEY_SECRET_NAME")
-        or os.getenv("OPENAI_SECRET_NAME")
-        or "openai/api-key"
-    )
-    region = os.getenv("AWS_REGION", "us-east-1")
-
-    try:
-        return _get_openai_key_from_secrets(secret_name, region)
-    except Exception as e:
-        raise RuntimeError(
-            f"❌ Failed to retrieve OpenAI API key from Secrets Manager "
-            f"(secret='{secret_name}', region='{region}'): {e}"
-        )
-
-# Initialize OpenAI client (unless disabled)
-OPENAI_CLIENT: OpenAI | None = None
-if not LLM_DISABLED:
-    OPENAI_CLIENT = OpenAI(api_key=get_openai_key())
-
-logger.info("✅ SCRIPT IS RUNNING")
-logger.info("📡 ECS log stream: %s", os.getenv("LOG_STREAM", "unknown"))
-logger.info("🆔 ECS task ID: %s", os.getenv("TASK_ID", "unknown"))
-logger.info("🧩 USE_LANGCHAIN=%s", USE_LANGCHAIN)
-
-# ========
-# Prompts
-# ========
-RISK_PROMPT = (
-    "Please assume the role of a primary care physician. Based on the following patient summary text, "
-    "provide a single risk rating between 1 and 100 for the patient's need for follow-up care within the next year, "
-    "with 1 being nearly no risk and 100 being the greatest risk.\n\n"
-    "Respond in the following format:\n\n"
-    "Risk Score: <numeric_value>\n"
-    "<Brief explanation or justification here (optional)>\n\n"
-    "Here is the patient summary:\n\n"
-)
-
-COMBINED_PROMPT = """
-You are a primary care physician reviewing the following patient note:
-
-{note}
-
-Please answer the following questions based on the note above.
-Respond ONLY with your answers — no explanations, no repetition of questions.
-
-Format your response exactly like this:
-
-Follow-up 1 month: <Yes/No>
-Follow-up 6 months: <Yes/No>
-Oncology recommended: <Yes/No>
-Cardiology recommended: <Yes/No>
-
-Top Medical Concerns:
-1. <Most important medical concern>
-2. <Second most important medical concern>
-3. <Third most important medical concern>
-4. <Fourth most important medical concern>
-5. <Fifth most important medical concern>
-"""
 
 # ==================
 # Utility Functions
@@ -259,91 +114,6 @@ def extract_risk_score(text):
         return None
     return None
 
-# --- Robust OpenAI caller with backoff + jitter + optional throttle ---
-def get_chat_response(
-    inquiry_note,
-    model=OPENAI_MODEL,
-    retries=8,
-    base_delay=1.5,
-    max_delay=20,
-    temperature: float | None = None,
-    max_tokens: int | None = None,
-    timeout_sec: int | None = None,
-):
-    """
-    Calls OpenAI Chat Completions (OpenAI Python SDK v1.x) with exponential backoff and jitter.
-    Respects GLOBAL_THROTTLE between calls if set via env OPENAI_THROTTLE_SEC.
-    Uses shared knobs (temperature/max_tokens/timeout) unless explicitly overridden.
-    If LLM_DISABLED=true, returns a deterministic stub.
-    """
-    if temperature is None:
-        temperature = OPENAI_TEMPERATURE
-    if max_tokens is None:
-        max_tokens = OPENAI_MAX_TOKENS
-    if timeout_sec is None:
-        timeout_sec = OPENAI_TIMEOUT_SEC
-
-    if LLM_DISABLED:
-        if inquiry_note.strip().startswith("Please assume the role"):
-            return {"message": {"content": "Risk Score: 72\nLikely follow-up needed."}}
-        return {"message": {"content": (
-            "Follow-up 1 month: Yes\n"
-            "Follow-up 6 months: Yes\n"
-            "Oncology recommended: No\n"
-            "Cardiology recommended: Yes\n\n"
-            "Top Medical Concerns:\n"
-            "1. Hypertension\n2. A1c elevation\n3. Chest pain\n4. Medication adherence\n5. BMI"
-        )}}
-
-    if OPENAI_CLIENT is None:
-        raise RuntimeError("OPENAI_CLIENT not initialized (check LLM_DISABLED and OPENAI_API_KEY injection).")
-
-    last_err = None
-    for attempt in range(retries):
-        try:
-            if GLOBAL_THROTTLE > 0:
-                time.sleep(GLOBAL_THROTTLE)
-
-            resp = OPENAI_CLIENT.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": str(inquiry_note)}],
-                temperature=float(temperature),
-                max_tokens=int(max_tokens),
-                timeout=float(timeout_sec),
-            )
-
-            content = ""
-            try:
-                content = resp.choices[0].message.content or ""
-            except Exception:
-                content = ""
-
-            return {"message": {"content": content}}
-
-        except (RateLimitError, APITimeoutError, APIConnectionError, APIError) as e:
-            last_err = e
-            sleep_s = min(max_delay, base_delay * (2 ** attempt)) * (0.5 + random.random())
-            logger.warning("OpenAI transient error on attempt %d: %s. Backing off %.1fs...", attempt + 1, e, sleep_s)
-            time.sleep(sleep_s)
-
-        except Exception as e:
-            last_err = e
-            msg = str(e).lower()
-            transient = any(s in msg for s in [
-                "rate limit", "server is overloaded", "overloaded", "503", "timeout",
-                "temporarily unavailable", "connection", "bad gateway", "gateway timeout", "service unavailable"
-            ])
-            if not transient and attempt >= 1:
-                logger.warning("Non-transient OpenAI error on attempt %d: %s", attempt + 1, e)
-                break
-
-            sleep_s = min(max_delay, base_delay * (2 ** attempt)) * (0.5 + random.random())
-            logger.warning("Attempt %d failed: %s. Backing off %.1fs...", attempt + 1, e, sleep_s)
-            time.sleep(sleep_s)
-
-    logger.error("All retries failed for OpenAI API. Last error: %s", last_err)
-    return {"message": {"content": ""}}
-
 def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
     if not s3_uri.startswith("s3://"):
         raise ValueError(f"Expected s3://... URI, got: {s3_uri}")
@@ -372,112 +142,6 @@ def _read_csv_s3_in_chunks(s3_client, s3_uri: str, chunksize: int, aws_region: s
     obj = s3_client.get_object(Bucket=bucket, Key=key)
     text_stream = TextIOWrapper(obj["Body"], encoding="utf-8")
     return pd.read_csv(text_stream, chunksize=chunksize)
-
-# -----------------------------
-# LangChain wedge (optional)
-# -----------------------------
-def _risk_rating_via_langchain(note_text: str) -> tuple[str, str | None]:
-    """
-    Returns (risk_rating_text, optional_rationale_text).
-
-    risk_rating_text is formatted to match your existing downstream parser:
-      "Risk Score: <1-100>\n..."
-
-    rationale_text is optional (nice-to-have for portfolio); safe to ignore.
-    """
-    if LLM_DISABLED:
-        return "Risk Score: 72\nLikely follow-up needed.", "Likely follow-up needed."
-
-    try:
-        from src.llm_chain import assess_note_with_langchain  # type: ignore
-    except Exception as e:
-        logger.warning("USE_LANGCHAIN=true but src.llm_chain import failed (%s). Falling back to OpenAI path.", e)
-        return get_chat_response(RISK_PROMPT + str(note_text))["message"]["content"], None
-
-    try:
-        try:
-            assessment = assess_note_with_langchain(
-                note_text=str(note_text),
-                rag_context="",
-                model=OPENAI_MODEL,
-                temperature=OPENAI_TEMPERATURE,
-                max_tokens=OPENAI_MAX_TOKENS,
-                timeout_sec=OPENAI_TIMEOUT_SEC,
-            )
-        except TypeError:
-            assessment = assess_note_with_langchain(note_text=str(note_text), rag_context="")
-
-        score_0_1 = float(assessment.risk_score)
-        score_1_100 = max(1, min(100, int(round(score_0_1 * 100))))
-
-        rationale = ""
-        try:
-            if getattr(assessment, "rationale_bullets", None):
-                rationale = "\n".join(f"- {b}" for b in assessment.rationale_bullets if str(b).strip())
-        except Exception:
-            rationale = ""
-
-        risk_text = f"Risk Score: {score_1_100}"
-        if rationale:
-            risk_text += f"\n{rationale}"
-
-        return risk_text, (rationale if rationale else None)
-    except Exception as e:
-        logger.warning("LangChain assessment failed (%s). Falling back to OpenAI path.", e)
-        return get_chat_response(RISK_PROMPT + str(note_text))["message"]["content"], None
-
-def query_combined_prompt(note, template=COMBINED_PROMPT):
-    note_text = str(note)
-
-    rag_audit_text = None
-    audit_max = int(os.getenv("RAG_AUDIT_MAX_CHARS", "1200"))
-
-    if RAG_INDEX is not None:
-        try:
-            top_k = int(os.getenv("RAG_TOP_K", "4"))
-            max_chars = int(os.getenv("RAG_MAX_CHARS", "2500"))
-
-            snips = retrieve_kb(note_text, RAG_INDEX, top_k=top_k)
-
-            best_sim = None
-            titles_str = ""
-            kb_ids_str = ""
-            try:
-                if snips is not None and not snips.empty:
-                    if "similarity" in snips.columns:
-                        best_sim = float(snips["similarity"].max())
-                    if "title" in snips.columns:
-                        titles_str = " | ".join(snips["title"].astype(str).tolist())[:300]
-                    if "kb_id" in snips.columns:
-                        kb_ids_str = ",".join(snips["kb_id"].astype(str).tolist())[:200]
-            except Exception:
-                pass
-
-            rag_block = format_rag_context(snips, max_chars=max_chars)
-
-            if rag_block:
-                rag_audit_text = rag_block[:audit_max]
-                logger.info(
-                    "🧠 RAG injected: top_k=%d, chars=%d%s%s%s",
-                    top_k,
-                    len(rag_block),
-                    f", best_sim={best_sim:.3f}" if best_sim is not None else "",
-                    f", kb_ids={kb_ids_str}" if kb_ids_str else "",
-                    f", titles={titles_str}" if titles_str else "",
-                )
-                note_text = f"{rag_block}\n\nPATIENT NOTE:\n{note_text}"
-            else:
-                logger.info(
-                    "🧠 RAG enabled but no context returned (top_k=%d%s)",
-                    top_k,
-                    f", best_sim={best_sim:.3f}" if best_sim is not None else "",
-                )
-        except Exception as e:
-            logger.warning(f"RAG retrieval failed: {e}")
-
-    prompt = template.format(note=note_text)
-    response = get_chat_response(prompt)["message"]["content"]
-    return response, rag_audit_text
 
 def safe_split(line, label):
     try:
