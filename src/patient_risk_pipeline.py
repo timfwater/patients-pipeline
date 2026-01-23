@@ -8,11 +8,9 @@ import random
 import argparse
 from datetime import datetime, timedelta, timezone
 from io import TextIOWrapper
-
 import boto3
 import pandas as pd
 import requests
-
 from src.pipeline_core import run_pipeline
 
 from openai import (
@@ -52,6 +50,7 @@ from src.llm import (
 # =========================
 # RAG
 # =========================
+
 RAG_INDEX = None
 try:
     RAG_INDEX = build_index_from_env()
@@ -71,6 +70,7 @@ logger.info("🧠 RAG_MAX_CHARS=%s", os.getenv("RAG_MAX_CHARS", "unset"))
 # ==================
 # Utility Functions
 # ==================
+
 def get_ecs_metadata_task_id():
     try:
         metadata_uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
@@ -96,8 +96,8 @@ ecs_task_id = get_ecs_metadata_task_id()
 os.environ["TASK_ID"] = ecs_task_id or os.getenv("TASK_ID", "unknown")
 os.environ["RUN_ID"] = os.getenv("RUN_ID", datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
 
-
 # ---------- CLI wrapper ----------
+
 def main():
     parser = argparse.ArgumentParser(description="Patient Risk Pipeline")
     parser.add_argument("--input", dest="input_s3", default=os.getenv("INPUT_S3"),
