@@ -172,6 +172,14 @@ else
     ]' <<<"$task_policy")
 fi
 
+# Bedrock (Claude) invoke permission
+task_policy=$(jq \
+  '.Statement += [
+    {"Sid":"BedrockInvoke","Effect":"Allow",
+     "Action":["bedrock:InvokeModel","bedrock:InvokeModelWithResponseStream"],
+     "Resource":"*"}
+  ]' <<<"$task_policy")
+
 # Secrets Manager at runtime (only if the APP fetches it)
 if [[ -n "$RESOLVED_OPENAI_SECRET_ARN" && "$APP_FETCHES_OPENAI_SECRET_AT_RUNTIME" == "true" ]]; then
   task_policy=$(jq \

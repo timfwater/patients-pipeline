@@ -15,11 +15,13 @@ import pandas as pd
 import requests
 import openai
 from src.deidentify import deidentify, reidentify
+from src.llm_bedrock import get_claude_response
 
 # =========================
 # Config knobs (env-override)
 # =========================
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()  # "openai" or "bedrock"
 GLOBAL_THROTTLE = float(os.getenv("OPENAI_THROTTLE_SEC", "0") or 0)
 LLM_DISABLED = os.getenv("LLM_DISABLED", "false").lower() == "true"  # for fast smoke tests
 CSV_CHUNK_ROWS = int(os.getenv("CSV_CHUNK_ROWS", "5000"))  # streaming chunk size
@@ -187,11 +189,13 @@ def extract_risk_score(text):
     return None
 
 # --- Robust OpenAI caller with backoff + jitter + optional throttle ---
+# --- Robust OpenAI caller with backoff + jitter + optional throttle ---
 def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.5, max_delay=20):
     """
     Calls OpenAI ChatCompletion with exponential backoff and jitter.
     Respects GLOBAL_THROTTLE (seconds) between calls if set via env OPENAI_THROTTLE_SEC.
     If LLM_DISABLED=true, returns a deterministic stub.
+    NOTE: inquiry_note is expected to already be de-identified by the caller.
     """
     if LLM_DISABLED:
         if inquiry_note.strip().startswith("Please assume the role"):
@@ -210,17 +214,13 @@ def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.
         try:
             if GLOBAL_THROTTLE > 0:
                 time.sleep(GLOBAL_THROTTLE)
-            scrubbed_note, mapping = deidentify(inquiry_note)
-            logger.info(f"🔒 De-identification: {len(mapping)} items scrubbed. Placeholders: {list(mapping.keys())}")
-
             resp = openai.ChatCompletion.create(
                 model=model,
-                messages=[{"role": "user", "content": scrubbed_note}],
+                messages=[{"role": "user", "content": inquiry_note}],
                 timeout=60,
             )
-            restored_content = reidentify(resp.choices[0].message.content, mapping)
-            return {"message": {"content": restored_content}}
-        
+            return {"message": {"content": resp.choices[0].message.content}}
+
         except Exception as e:
             last_err = e
             msg = str(e).lower()
@@ -237,9 +237,27 @@ def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.
     logger.error(f"All retries failed for OpenAI API. Last error: {last_err}")
     return {"message": {"content": ""}}
 
+def get_llm_response(inquiry_note):
+    """
+    Single entry point for all LLM calls. De-identifies once, here, regardless
+    of provider, then dispatches to OpenAI or Bedrock/Claude based on
+    LLM_PROVIDER, then re-identifies the response before returning.
+    """
+    scrubbed_note, mapping = deidentify(inquiry_note)
+    logger.info(f"🔒 De-identification: {len(mapping)} items scrubbed. Placeholders: {list(mapping.keys())}")
+
+    if LLM_PROVIDER == "bedrock":
+        raw = get_claude_response(scrubbed_note)
+    else:
+        raw = get_chat_response(scrubbed_note)
+
+    restored_content = reidentify(raw["message"]["content"], mapping)
+    return {"message": {"content": restored_content}}
+
 def query_combined_prompt(note, template=COMBINED_PROMPT):
     prompt = template.format(note=note)
-    response = get_chat_response(prompt)['message']['content']
+    #response = get_chat_response(prompt)['message']['content']
+    response = get_llm_response(prompt)['message']['content']
     return response
 
 def safe_split(line, label):
@@ -452,7 +470,8 @@ def run_pipeline(
         # ---- Risk scoring
         logger.info(f"🧪 Chunk {chunk_idx}: scoring {len(df_to_score)} notes (budget remaining before: {remaining_to_score})")
         df_to_score['risk_rating'] = df_to_score['full_note'].apply(
-            lambda note: get_chat_response(RISK_PROMPT + str(note))['message']['content']
+            lambda note: get_llm_response(RISK_PROMPT + str(note))['message']['content']
+           #lambda note: get_chat_response(RISK_PROMPT + str(note))['message']['content']
         )
         df_to_score['risk_score'] = df_to_score['risk_rating'].apply(extract_risk_score)
         remaining_to_score -= len(df_to_score)
