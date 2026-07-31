@@ -31,6 +31,7 @@ RUN apt-get update \
 # Install Python deps first for better layer caching
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt
+RUN python -m spacy download en_core_web_lg
 
 # Copy application code
 COPY . .
@@ -50,3 +51,4 @@ CMD ["python", "-u", "-m", "src.patient_risk_pipeline"]
 # Lightweight healthcheck (replace with something app-specific if needed)
 HEALTHCHECK --interval=60s --timeout=5s --start-period=20s --retries=3 \
   CMD ["python", "-c", "print('ok')"]
+

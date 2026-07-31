@@ -14,6 +14,7 @@ import boto3
 import pandas as pd
 import requests
 import openai
+from src.deidentify import deidentify, reidentify
 
 # =========================
 # Config knobs (env-override)
@@ -209,12 +210,17 @@ def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.
         try:
             if GLOBAL_THROTTLE > 0:
                 time.sleep(GLOBAL_THROTTLE)
+            scrubbed_note, mapping = deidentify(inquiry_note)
+            logger.info(f"🔒 De-identification: {len(mapping)} items scrubbed. Placeholders: {list(mapping.keys())}")
+
             resp = openai.ChatCompletion.create(
                 model=model,
-                messages=[{"role": "user", "content": inquiry_note}],
+                messages=[{"role": "user", "content": scrubbed_note}],
                 timeout=60,
             )
-            return {"message": {"content": resp.choices[0].message.content}}
+            restored_content = reidentify(resp.choices[0].message.content, mapping)
+            return {"message": {"content": restored_content}}
+        
         except Exception as e:
             last_err = e
             msg = str(e).lower()
