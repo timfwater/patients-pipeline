@@ -16,6 +16,7 @@ import requests
 import openai
 from src.deidentify import deidentify, reidentify
 from src.llm_bedrock import get_claude_response
+from src.rag_tfidf import build_index_from_env, retrieve_kb, format_rag_context
 
 # =========================
 # Config knobs (env-override)
@@ -102,6 +103,27 @@ if not LLM_DISABLED:
 logger.info("✅ SCRIPT IS RUNNING")
 logger.info(f"📡 ECS log stream: {os.getenv('LOG_STREAM', 'unknown')}")
 logger.info(f"🆔 ECS task ID: {os.getenv('TASK_ID', 'unknown')}")
+
+# =========================
+# RAG (optional clinical KB grounding)
+# =========================
+RAG_INDEX = None
+try:
+    RAG_INDEX = build_index_from_env()
+except Exception as e:
+    # If RAG_ENABLED=false, build_index_from_env() returns None (no exception).
+    # If RAG_ENABLED=true but misconfigured, this warning tells you why, and the
+    # pipeline continues running without retrieval rather than failing the run.
+    logger.warning("RAG unavailable: %s", e)
+    RAG_INDEX = None
+
+logger.info("🧠 RAG_INDEX loaded: %s", "YES" if RAG_INDEX is not None else "NO")
+logger.info("🧠 RAG_ENABLED=%s", os.getenv("RAG_ENABLED", "unset"))
+logger.info("🧠 RAG_KB_PATH=%s", os.getenv("RAG_KB_PATH", "unset"))
+logger.info("🧠 RAG_TOP_K=%s", os.getenv("RAG_TOP_K", "unset"))
+
+# Tracks how many notes actually received RAG context this run, for audit reporting
+RAG_INJECT_COUNT = 0
 
 # ========
 # Prompts
@@ -198,7 +220,7 @@ def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.
     NOTE: inquiry_note is expected to already be de-identified by the caller.
     """
     if LLM_DISABLED:
-        if inquiry_note.strip().startswith("Please assume the role"):
+        if "Please assume the role" in inquiry_note:
             return {"message": {"content": "Risk Score: 72\nLikely follow-up needed."}}
         else:
             return {"message": {"content": (
@@ -240,16 +262,39 @@ def get_chat_response(inquiry_note, model=OPENAI_MODEL, retries=8, base_delay=1.
 def get_llm_response(inquiry_note):
     """
     Single entry point for all LLM calls. De-identifies once, here, regardless
-    of provider, then dispatches to OpenAI or Bedrock/Claude based on
-    LLM_PROVIDER, then re-identifies the response before returning.
+    of provider; optionally grounds the prompt with retrieved clinical KB
+    context (RAG) if RAG_ENABLED=true; then dispatches to OpenAI or
+    Bedrock/Claude based on LLM_PROVIDER; then re-identifies the response.
     """
     scrubbed_note, mapping = deidentify(inquiry_note)
     logger.info(f"🔒 De-identification: {len(mapping)} items scrubbed. Placeholders: {list(mapping.keys())}")
 
-    if LLM_PROVIDER == "bedrock":
-        raw = get_claude_response(scrubbed_note)
+    global RAG_INJECT_COUNT
+    llm_input = scrubbed_note
+    if RAG_INDEX is not None:
+        try:
+            top_k = int(os.getenv("RAG_TOP_K", "4"))
+            max_chars = int(os.getenv("RAG_MAX_CHARS", "2500"))
+            snips = retrieve_kb(scrubbed_note, RAG_INDEX, top_k=top_k)
+            rag_block = format_rag_context(snips, max_chars=max_chars)
+            if rag_block:
+                logger.info(f"🧠 RAG injected: top_k={top_k}, chars={len(rag_block)}")
+                llm_input = f"{rag_block}\n\n{scrubbed_note}"
+                RAG_INJECT_COUNT += 1
+            else:
+                logger.info(f"🧠 RAG enabled but no context returned (top_k={top_k})")
+        except Exception as e:
+            logger.warning(f"RAG retrieval failed, continuing without context: {e}")
+
+    if LLM_DISABLED:
+        # Fast smoke-test path for both providers. Previously LLM_DISABLED only
+        # short-circuited OpenAI; Bedrock would still make a real network call,
+        # which hangs/fails in any environment without Bedrock network access.
+        raw = get_chat_response(llm_input)
+    elif LLM_PROVIDER == "bedrock":
+        raw = get_claude_response(llm_input)
     else:
-        raw = get_chat_response(scrubbed_note)
+        raw = get_chat_response(llm_input)
 
     restored_content = reidentify(raw["message"]["content"], mapping)
     return {"message": {"content": restored_content}}
@@ -429,6 +474,10 @@ def run_pipeline(
                     "run_duration_sec": round(time.time() - start_time, 2),
                     "ecs_task_id": os.getenv("TASK_ID"),
                     "ecs_log_stream": os.getenv("LOG_STREAM", "unknown"),
+                    "llm_provider": LLM_PROVIDER,
+                    "bedrock_model_id": os.getenv("BEDROCK_MODEL_ID") if LLM_PROVIDER == "bedrock" else None,
+                    "rag_enabled": RAG_INDEX is not None,
+                    "rag_context_count": RAG_INJECT_COUNT,
                     "warning": f"Missing required input columns: {missing_cols}",
                 }
                 audit_bucket = os.getenv("AUDIT_BUCKET", output_bucket)
@@ -566,6 +615,10 @@ Your Clinical Risk Bot
         "ecs_task_id": os.getenv("TASK_ID"),
         "ecs_log_stream": os.getenv("LOG_STREAM", "unknown"),
         "run_id": os.getenv("RUN_ID", "unknown"),
+        "llm_provider": LLM_PROVIDER,
+        "bedrock_model_id": os.getenv("BEDROCK_MODEL_ID") if LLM_PROVIDER == "bedrock" else None,
+        "rag_enabled": RAG_INDEX is not None,
+        "rag_context_count": RAG_INJECT_COUNT,
     }
 
     audit_bucket = os.getenv("AUDIT_BUCKET", output_bucket)

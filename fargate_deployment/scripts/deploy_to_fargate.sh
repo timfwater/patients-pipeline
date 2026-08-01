@@ -166,6 +166,13 @@ ENV_JSON="$(jq -n \
   --arg MAX_NOTES         "$MAX_NOTES" \
   --arg LOG_FORMAT        "$LOG_FORMAT" \
   --arg LOG_LEVEL         "$LOG_LEVEL" \
+  --arg LLM_PROVIDER      "${LLM_PROVIDER:-openai}" \
+  --arg BEDROCK_REGION    "${BEDROCK_REGION:-}" \
+  --arg BEDROCK_MODEL_ID  "${BEDROCK_MODEL_ID:-}" \
+  --arg RAG_ENABLED       "${RAG_ENABLED:-false}" \
+  --arg RAG_KB_PATH       "${RAG_KB_PATH:-}" \
+  --arg RAG_TOP_K         "${RAG_TOP_K:-4}" \
+  --arg RAG_MAX_CHARS     "${RAG_MAX_CHARS:-2500}" \
   '
   [
     {name:"AWS_REGION",        value:$AWS_REGION},
@@ -187,7 +194,14 @@ ENV_JSON="$(jq -n \
     {name:"DRY_RUN_EMAIL",     value:$DRY_RUN_EMAIL},
     {name:"MAX_NOTES",         value:$MAX_NOTES},
     {name:"LOG_FORMAT",        value:$LOG_FORMAT},
-    {name:"LOG_LEVEL",         value:$LOG_LEVEL}
+    {name:"LOG_LEVEL",         value:$LOG_LEVEL},
+    {name:"LLM_PROVIDER",      value:$LLM_PROVIDER},
+    {name:"BEDROCK_REGION",    value:$BEDROCK_REGION},
+    {name:"BEDROCK_MODEL_ID",  value:$BEDROCK_MODEL_ID},
+    {name:"RAG_ENABLED",       value:$RAG_ENABLED},
+    {name:"RAG_KB_PATH",       value:$RAG_KB_PATH},
+    {name:"RAG_TOP_K",         value:$RAG_TOP_K},
+    {name:"RAG_MAX_CHARS",     value:$RAG_MAX_CHARS}
   ]')"
 
 # If using plaintext API key, append it to env
